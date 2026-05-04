@@ -147,6 +147,128 @@ async def test_clink_tool_truncates_large_output(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_clink_tool_forwards_progress_notifications(monkeypatch):
+    """Progress callback should fire send_progress_notification for each agent event."""
+    tool = CLinkTool()
+
+    captured_kwargs: dict = {}
+
+    async def fake_run(**kwargs):
+        captured_kwargs.update(kwargs)
+        on_event = kwargs.get("on_event")
+        # Simulate the agent emitting two stdout lines and one stderr line.
+        if on_event:
+            await on_event("stdout", "first line")
+            await on_event("stderr", "warn")
+            await on_event("stdout", "second line")
+        return AgentOutput(
+            parsed=ParsedCLIResponse(content="ok", metadata={"model_used": "gemini-2.5-pro"}),
+            sanitized_command=["gemini"],
+            returncode=0,
+            stdout="ok",
+            stderr="",
+            duration_seconds=0.1,
+            parser_name="gemini_json",
+            output_file_content=None,
+        )
+
+    class DummyAgent:
+        async def run(self, **kwargs):
+            return await fake_run(**kwargs)
+
+    monkeypatch.setattr("tools.clink.create_agent", lambda client: DummyAgent())
+
+    progress_calls: list[dict] = []
+
+    class FakeSession:
+        async def send_progress_notification(self, **kwargs):
+            progress_calls.append(kwargs)
+
+    class FakeMeta:
+        progressToken = "tok-123"
+
+    class FakeRequestContext:
+        meta = FakeMeta()
+        session = FakeSession()
+
+    class FakeServer:
+        request_context = FakeRequestContext()
+
+    # Inject a fake server module so _build_progress_callback resolves a token.
+    import sys
+    import types
+
+    fake_server_module = types.ModuleType("server")
+    fake_server_module.server = FakeServer()
+    monkeypatch.setitem(sys.modules, "server", fake_server_module)
+
+    arguments = {
+        "prompt": "Hi",
+        "cli_name": "gemini",
+        "absolute_file_paths": [],
+        "images": [],
+    }
+
+    await tool.execute(arguments)
+
+    assert "on_event" in captured_kwargs and captured_kwargs["on_event"] is not None
+    assert len(progress_calls) == 3
+    assert progress_calls[0]["progress_token"] == "tok-123"
+    assert progress_calls[0]["progress"] == 1.0
+    assert "[gemini:stdout]" in progress_calls[0]["message"]
+    assert "[gemini:stderr]" in progress_calls[1]["message"]
+    assert progress_calls[2]["progress"] == 3.0
+
+
+@pytest.mark.asyncio
+async def test_clink_tool_skips_progress_when_no_token(monkeypatch):
+    """Without a progressToken in request meta, on_event should be None."""
+    tool = CLinkTool()
+
+    captured_kwargs: dict = {}
+
+    async def fake_run(**kwargs):
+        captured_kwargs.update(kwargs)
+        return AgentOutput(
+            parsed=ParsedCLIResponse(content="ok", metadata={}),
+            sanitized_command=["gemini"],
+            returncode=0,
+            stdout="ok",
+            stderr="",
+            duration_seconds=0.1,
+            parser_name="gemini_json",
+            output_file_content=None,
+        )
+
+    class DummyAgent:
+        async def run(self, **kwargs):
+            return await fake_run(**kwargs)
+
+    monkeypatch.setattr("tools.clink.create_agent", lambda client: DummyAgent())
+
+    class FakeMeta:
+        progressToken = None
+
+    class FakeRequestContext:
+        meta = FakeMeta()
+        session = object()
+
+    class FakeServer:
+        request_context = FakeRequestContext()
+
+    import sys
+    import types
+
+    fake_server_module = types.ModuleType("server")
+    fake_server_module.server = FakeServer()
+    monkeypatch.setitem(sys.modules, "server", fake_server_module)
+
+    await tool.execute({"prompt": "Hi", "cli_name": "gemini", "absolute_file_paths": [], "images": []})
+
+    assert captured_kwargs.get("on_event") is None
+
+
+@pytest.mark.asyncio
 async def test_clink_tool_truncates_without_summary(monkeypatch):
     tool = CLinkTool()
 

@@ -204,6 +204,7 @@ class CLinkTool(SimpleTool):
             self._raise_tool_error(f"Failed to prepare prompt: {exc}")
 
         agent = create_agent(client_config)
+        on_event = self._build_progress_callback(client_config.name)
         try:
             result = await agent.run(
                 role=role_config,
@@ -211,6 +212,7 @@ class CLinkTool(SimpleTool):
                 system_prompt=system_prompt_text if system_prompt_text.strip() else None,
                 files=absolute_file_paths,
                 images=images,
+                on_event=on_event,
             )
         except CLIAgentError as exc:
             metadata = self._build_error_metadata(client_config, exc)
@@ -445,6 +447,62 @@ class CLinkTool(SimpleTool):
             "available tools. Gather current information yourself and deliver the final answer without "
             "asking the PAL MCP host to perform searches or file reads."
         )
+
+    def _build_progress_callback(self, cli_name: str):
+        """Return an async callback that forwards CLI stdio lines as MCP progress.
+
+        Streaming progress notifications keep the wrapper subagent's stream watchdog
+        alive during long codex/gemini runs: without them, ~600s of stdio silence on
+        the subagent process would cause the harness to kill the subagent before the
+        wrapped CLI finishes.
+
+        Returns None when no progress token was supplied by the client (older clients,
+        or when the tool is invoked outside an MCP request scope, e.g. in unit tests).
+        Errors during context lookup or notification dispatch are swallowed so they
+        never abort the underlying CLI run.
+        """
+        try:
+            from server import server as mcp_server
+        except Exception:
+            return None
+
+        try:
+            request_context = mcp_server.request_context
+        except (AttributeError, LookupError):
+            return None
+
+        meta = getattr(request_context, "meta", None)
+        progress_token = getattr(meta, "progressToken", None) if meta else None
+        session = getattr(request_context, "session", None)
+        if progress_token is None or session is None:
+            return None
+
+        send_progress = getattr(session, "send_progress_notification", None)
+        if send_progress is None:
+            return None
+
+        progress_counter = 0
+        max_message_chars = 240
+
+        async def on_event(kind: str, text: str) -> None:
+            nonlocal progress_counter
+            progress_counter += 1
+            stripped = text.strip()
+            if not stripped:
+                return
+            if len(stripped) > max_message_chars:
+                stripped = stripped[:max_message_chars] + "…"
+            message = f"[{cli_name}:{kind}] {stripped}"
+            try:
+                await send_progress(
+                    progress_token=progress_token,
+                    progress=float(progress_counter),
+                    message=message,
+                )
+            except Exception:
+                logger.debug("Failed to send progress notification", exc_info=True)
+
+        return on_event
 
     def _format_file_references(self, files: list[str]) -> str:
         if not files:

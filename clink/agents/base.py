@@ -9,7 +9,7 @@ import shlex
 import shutil
 import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,6 +18,12 @@ from clink.models import ResolvedCLIClient, ResolvedCLIRole
 from clink.parsers import BaseParser, ParsedCLIResponse, ParserError, get_parser
 
 logger = logging.getLogger("clink.agent")
+
+
+# Async callback invoked for each subprocess output event so callers (e.g. the clink
+# tool) can forward MCP progress notifications. Receives (kind, text) where kind is
+# "stdout" or "stderr" and text is a single decoded line without trailing newline.
+EventCallback = Callable[[str, str], Awaitable[None]]
 
 
 @dataclass
@@ -60,6 +66,7 @@ class BaseCLIAgent:
         system_prompt: str | None = None,
         files: Sequence[str],
         images: Sequence[str],
+        on_event: EventCallback | None = None,
     ) -> AgentOutput:
         # Files and images are already embedded into the prompt by the tool; they are
         # accepted here only to keep parity with SimpleTool callers.
@@ -121,13 +128,16 @@ class BaseCLIAgent:
             raise CLIAgentError(f"Executable not found for CLI '{self.client.name}': {exc}") from exc
 
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(prompt.encode("utf-8")),
+            stdout_text, stderr_text = await asyncio.wait_for(
+                self._stream_subprocess(process, prompt.encode("utf-8"), on_event),
                 timeout=self.client.timeout_seconds,
             )
         except asyncio.TimeoutError as exc:
             process.kill()
-            await process.communicate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except asyncio.TimeoutError:  # pragma: no cover - defensive
+                pass
             raise CLIAgentError(
                 f"CLI '{self.client.name}' timed out after {self.client.timeout_seconds} seconds",
                 returncode=None,
@@ -135,8 +145,6 @@ class BaseCLIAgent:
 
         duration = time.monotonic() - start_time
         return_code = process.returncode
-        stdout_text = stdout_bytes.decode("utf-8", errors="replace")
-        stderr_text = stderr_bytes.decode("utf-8", errors="replace")
 
         if output_file_path and output_file_path.exists():
             output_file_content = output_file_path.read_text(encoding="utf-8", errors="replace")
@@ -189,6 +197,70 @@ class BaseCLIAgent:
             parser_name=self._parser.name,
             output_file_content=output_file_content,
         )
+
+    async def _stream_subprocess(
+        self,
+        process: asyncio.subprocess.Process,
+        stdin_bytes: bytes,
+        on_event: EventCallback | None,
+    ) -> tuple[str, str]:
+        """Feed stdin and concurrently drain stdout/stderr line-by-line.
+
+        Each decoded line is appended to the in-memory buffer AND forwarded to
+        on_event (if provided). This keeps continuous stdio activity flowing
+        through the MCP boundary so subagent watchdogs don't kill long calls
+        during quiet stretches of the wrapped CLI subprocess.
+        """
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+
+        async def feed_stdin() -> None:
+            if process.stdin is None:  # pragma: no cover - defensive
+                return
+            try:
+                process.stdin.write(stdin_bytes)
+                await process.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                # The child may exit before consuming stdin; that's fine.
+                pass
+            finally:
+                try:
+                    process.stdin.close()
+                except Exception:  # pragma: no cover - defensive
+                    pass
+
+        async def drain_stream(
+            reader: asyncio.StreamReader | None,
+            chunks: list[str],
+            kind: str,
+        ) -> None:
+            if reader is None:  # pragma: no cover - defensive
+                return
+            while True:
+                try:
+                    line = await reader.readline()
+                except ValueError:
+                    # Line exceeded the configured buffer limit. Fall back to
+                    # bounded reads so we still consume the remaining output.
+                    line = await reader.read(DEFAULT_STREAM_LIMIT)
+                if not line:
+                    break
+                decoded = line.decode("utf-8", errors="replace")
+                chunks.append(decoded)
+                if on_event is not None:
+                    try:
+                        await on_event(kind, decoded.rstrip("\r\n"))
+                    except Exception:
+                        # Never let progress-callback failures kill the run.
+                        self._logger.debug("on_event callback raised", exc_info=True)
+
+        await asyncio.gather(
+            feed_stdin(),
+            drain_stream(process.stdout, stdout_chunks, "stdout"),
+            drain_stream(process.stderr, stderr_chunks, "stderr"),
+        )
+        await process.wait()
+        return "".join(stdout_chunks), "".join(stderr_chunks)
 
     def _build_command(self, *, role: ResolvedCLIRole, system_prompt: str | None) -> list[str]:
         base = list(self.client.executable)

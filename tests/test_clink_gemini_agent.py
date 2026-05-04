@@ -9,14 +9,41 @@ from clink.agents.gemini import GeminiAgent
 from clink.models import ResolvedCLIClient, ResolvedCLIRole
 
 
+def _make_stream_reader(payload: bytes) -> asyncio.StreamReader:
+    reader = asyncio.StreamReader()
+    if payload:
+        reader.feed_data(payload)
+    reader.feed_eof()
+    return reader
+
+
+class _DummyStdin:
+    def __init__(self) -> None:
+        self.data: bytes = b""
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        self.data += data
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class DummyProcess:
     def __init__(self, *, stdout: bytes = b"", stderr: bytes = b"", returncode: int = 0):
-        self._stdout = stdout
-        self._stderr = stderr
+        self.stdout = _make_stream_reader(stdout)
+        self.stderr = _make_stream_reader(stderr)
+        self.stdin = _DummyStdin()
         self.returncode = returncode
 
-    async def communicate(self, _input):
-        return self._stdout, self._stderr
+    async def wait(self) -> int:
+        return self.returncode
+
+    def kill(self) -> None:
+        pass
 
 
 @pytest.fixture()
