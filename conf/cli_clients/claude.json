@@ -5,7 +5,7 @@
     "--permission-mode",
     "acceptEdits",
     "--model",
-    "sonnet"
+    "fable"
   ],
   "env": {},
   "roles": {
@@ -14,11 +14,15 @@
       "role_args": []
     },
     "planner": {
-      "prompt_path": "systemprompts/clink/default_planner.txt",
+      "prompt_path": "systemprompts/clink/claude_planner.txt",
       "role_args": []
     },
     "codereviewer": {
-      "prompt_path": "systemprompts/clink/default_codereviewer.txt",
+      "prompt_path": "systemprompts/clink/claude_codereviewer.txt",
+      "role_args": []
+    },
+    "sparring": {
+      "prompt_path": "systemprompts/clink/claude_sparring.txt",
       "role_args": []
     }
   }

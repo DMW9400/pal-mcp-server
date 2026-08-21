@@ -50,7 +50,7 @@ Gemini receives the full conversation context from `consensus` including the con
 
 - **Stay in one CLI**: No switching between terminal sessions or losing context
 - **Full conversation continuity**: Gemini's responses participate in the same conversation thread
-- **Role-based prompts**: Pre-configured roles for planning, code review, or general questions
+- **Role-based prompts**: Pre-configured roles for planning, code review, sparring, or general questions
 - **Full CLI capabilities**: Gemini can use its own web search, file tools, and latest features
 - **Token efficiency**: File references (not full content) to conserve tokens
 - **Cross-tool collaboration**: Combine with other PAL tools like `planner` → `clink` → `codereview`
@@ -73,13 +73,18 @@ clink with gemini with planner role to map out our microservices migration strat
 Use clink codereviewer role to review auth.py for security issues
 ```
 
+**Sparring Role** - Rigorous second-opinion analysis between agents
+```
+Use clink with claude and the sparring role to challenge this migration plan
+```
+
 You can make your own custom roles in `conf/cli_clients/` or tweak any of the shipped presets.
 
 ## Tool Parameters
 
 - `prompt`: Your question or task for the external CLI (required)
 - `cli_name`: Which CLI to use - `gemini` (default), `claude`, `codex`, or add your own in `conf/cli_clients/`
-- `role`: Preset role - `default`, `planner`, `codereviewer` (default: `default`)
+- `role`: Preset role - `default`, `planner`, `codereviewer`, `sparring` where configured (default: `default`)
 - `files`: Optional file paths for context (references only, CLI opens files itself)
 - `images`: Optional image paths for visual context
 - `continuation_id`: Continue previous clink conversations
@@ -99,6 +104,24 @@ clink to gemini codereviewer: Review payment_service.py for race conditions and 
 **Codex Code Review:**
 ```
 "clink with codex cli and perform a full code review using the codereview role"
+```
+
+**Codex ↔ Claude Planning:**
+```
+"Use clink with cli_name=claude and role=planner to have Claude produce a rollout plan for this refactor"
+```
+
+**Codex ↔ Claude Code Review:**
+```
+"Use clink with cli_name=claude and role=codereviewer to review the staged changes"
+```
+
+The Claude client advertises its configured model to Codex as the Clink partner model. With the shipped preset,
+the tool schema, Claude prompt, and response metadata all identify that partner as `fable`.
+
+**Codex ↔ Claude Sparring:**
+```
+"Use clink with cli_name=claude and role=sparring to challenge the assumptions in this design"
 ```
 
 **Quick Research Question:**
@@ -129,7 +152,7 @@ then codereview to verify the implementation"
 ## Best Practices
 
 - **Pre-authenticate CLIs**: Install and configure Gemini CLI first (`npm install -g @google/gemini-cli`)
-- **Choose appropriate roles**: Use `planner` for strategy, `codereviewer` for code, `default` for general questions
+- **Choose appropriate roles**: Use `planner` for strategy, `codereviewer` for code, `sparring` for second opinions, `default` for general questions
 - **Leverage CLI strengths**: Gemini's 1M context for large codebases, web search for current docs
 - **Combine with PAL tools**: Chain `clink` with `planner`, `codereview`, `debug` for powerful workflows
 - **File efficiency**: Pass file paths, let the CLI decide what to read (saves tokens)
@@ -139,7 +162,7 @@ then codereview to verify the implementation"
 Clink configurations live in `conf/cli_clients/`. We ship presets for the supported CLIs:
 
 - `gemini.json` – runs `gemini --telemetry false --yolo -o json`
-- `claude.json` – runs `claude --print --output-format json --permission-mode acceptEdits --model sonnet`
+- `claude.json` – runs `claude --print --output-format json --permission-mode acceptEdits --model fable` with Claude-specific `planner`, `codereviewer`, and `sparring` roles
 - `codex.json` – runs `codex exec --json --dangerously-bypass-approvals-and-sandbox`
 
 > **CAUTION**: These flags intentionally bypass each CLI's safety prompts so they can edit files or launch tools autonomously via MCP. Only enable them in trusted sandboxes and tailor role prompts or CLI configs if you need more guardrails.

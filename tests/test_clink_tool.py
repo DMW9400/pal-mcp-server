@@ -5,7 +5,7 @@ import pytest
 from clink import get_registry
 from clink.agents import AgentOutput
 from clink.parsers.base import ParsedCLIResponse
-from tools.clink import MAX_RESPONSE_CHARS, CLinkTool
+from tools.clink import MAX_RESPONSE_CHARS, CLinkRequest, CLinkTool
 
 
 @pytest.mark.asyncio
@@ -55,10 +55,18 @@ async def test_clink_tool_execute(monkeypatch):
 def test_registry_lists_roles():
     registry = get_registry()
     clients = registry.list_clients()
-    assert {"codex", "gemini"}.issubset(set(clients))
+    assert {"claude", "codex", "gemini"}.issubset(set(clients))
     roles = registry.list_roles("gemini")
     assert "default" in roles
     assert "default" in registry.list_roles("codex")
+    assert {"default", "planner", "codereviewer", "sparring"}.issubset(set(registry.list_roles("claude")))
+    claude_client = registry.get_client("claude")
+    model_arg_index = claude_client.config_args.index("--model")
+    assert claude_client.config_args[model_arg_index + 1] == "fable"
+    assert "sonnet" not in claude_client.config_args
+    assert claude_client.get_role("planner").prompt_path.name == "claude_planner.txt"
+    assert claude_client.get_role("codereviewer").prompt_path.name == "claude_codereviewer.txt"
+    assert claude_client.get_role("sparring").prompt_path.name == "claude_sparring.txt"
     codex_client = registry.get_client("codex")
     # Verify codex uses --enable web_search_request (not --search which is unsupported by exec)
     assert codex_client.config_args == [
@@ -67,6 +75,11 @@ def test_registry_lists_roles():
         "--enable",
         "web_search_request",
     ]
+
+
+def test_clink_schema_identifies_claude_fable_as_partner_model():
+    schema = CLinkTool().get_input_schema()
+    assert "claude (partner model: fable)" in schema["properties"]["cli_name"]["description"]
 
 
 @pytest.mark.asyncio
@@ -266,6 +279,73 @@ async def test_clink_tool_skips_progress_when_no_token(monkeypatch):
     await tool.execute({"prompt": "Hi", "cli_name": "gemini", "absolute_file_paths": [], "images": []})
 
     assert captured_kwargs.get("on_event") is None
+
+
+@pytest.mark.asyncio
+async def test_clink_tool_executes_claude_sparring_with_external_system_prompt(monkeypatch):
+    tool = CLinkTool()
+    captured_kwargs: dict = {}
+
+    async def fake_run(**kwargs):
+        captured_kwargs.update(kwargs)
+        return AgentOutput(
+            parsed=ParsedCLIResponse(content="Proceed with changes.", metadata={"model_used": "claude-fable-5"}),
+            sanitized_command=["claude", "--print", "--output-format", "json", "--model", "fable"],
+            returncode=0,
+            stdout='{"result": "Proceed with changes."}',
+            stderr="",
+            duration_seconds=0.1,
+            parser_name="claude_json",
+            output_file_content=None,
+        )
+
+    class DummyAgent:
+        async def run(self, **kwargs):
+            return await fake_run(**kwargs)
+
+    monkeypatch.setattr("tools.clink.create_agent", lambda client: DummyAgent())
+
+    result = await tool.execute(
+        {
+            "prompt": "Spar with Codex on whether this clink integration is complete.",
+            "cli_name": "claude",
+            "role": "sparring",
+            "absolute_file_paths": [],
+            "images": [],
+        }
+    )
+
+    payload = json.loads(result[0].text)
+    assert payload["status"] in {"success", "continuation_available"}
+    metadata = payload.get("metadata", {})
+    assert metadata.get("cli_name") == "claude"
+    assert metadata.get("partner_model") == "fable"
+    assert metadata.get("role") == "sparring"
+
+    assert captured_kwargs["role"].name == "sparring"
+    assert captured_kwargs["role"].prompt_path.name == "claude_sparring.txt"
+    assert captured_kwargs["system_prompt"].startswith("You are Claude Code sparring with Codex")
+    assert "Claude Code CLI agent" in captured_kwargs["prompt"]
+    assert "Claude Fable Clink partner model" in captured_kwargs["prompt"]
+    assert "Gemini CLI agent" not in captured_kwargs["prompt"]
+    assert "You are Claude Code sparring with Codex" not in captured_kwargs["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_clink_prepare_prompt_defaults_to_configured_cli():
+    tool = CLinkTool()
+    request = CLinkRequest(
+        prompt="Summarize the repository.",
+        cli_name=None,
+        role="default",
+        absolute_file_paths=[],
+        images=[],
+    )
+
+    prompt = await tool.prepare_prompt(request)
+
+    assert "Summarize the repository." in prompt
+    assert f"{tool._default_cli_name.capitalize()} CLI agent" in prompt
 
 
 @pytest.mark.asyncio

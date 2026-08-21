@@ -78,8 +78,8 @@ class CLinkTool(SimpleTool):
 
     def get_description(self) -> str:
         return (
-            "Link a request to an external AI CLI (Gemini CLI, Qwen CLI, etc.) through PAL MCP to reuse "
-            "their capabilities inside existing workflows."
+            "Link a request to an external AI CLI (Claude Code, Codex CLI, Gemini CLI, etc.) through PAL MCP "
+            "to reuse their capabilities inside existing workflows."
         )
 
     def get_annotations(self) -> dict[str, Any]:
@@ -110,7 +110,12 @@ class CLinkTool(SimpleTool):
             role_descriptions.append(f"{name}: {roles}")
 
         if role_descriptions:
-            cli_available = ", ".join(self._cli_names) if self._cli_names else "(none configured)"
+            cli_labels = []
+            for name in self._cli_names:
+                client = self._registry.get_client(name)
+                partner_model = self._configured_partner_model(client)
+                cli_labels.append(f"{name} (partner model: {partner_model})" if partner_model else name)
+            cli_available = ", ".join(cli_labels) if cli_labels else "(none configured)"
             default_text = (
                 f" Default: {self._default_cli_name}." if self._default_cli_name and len(self._cli_names) <= 1 else ""
             )
@@ -195,6 +200,7 @@ class CLinkTool(SimpleTool):
         try:
             prompt_text = await self._prepare_prompt_for_role(
                 request,
+                client_config,
                 role_config,
                 system_prompt=system_prompt_text,
                 include_system_prompt=include_system_prompt,
@@ -261,12 +267,14 @@ class CLinkTool(SimpleTool):
         return [TextContent(type="text", text=tool_output.model_dump_json())]
 
     async def prepare_prompt(self, request) -> str:
-        client_config = self._registry.get_client(request.cli_name)
+        selected_cli = request.cli_name or self._default_cli_name
+        client_config = self._registry.get_client(selected_cli)
         role_config = client_config.get_role(request.role)
         system_prompt_text = role_config.prompt_path.read_text(encoding="utf-8")
         include_system_prompt = not self._use_external_system_prompt(client_config)
         return await self._prepare_prompt_for_role(
             request,
+            client_config,
             role_config,
             system_prompt=system_prompt_text,
             include_system_prompt=include_system_prompt,
@@ -275,6 +283,7 @@ class CLinkTool(SimpleTool):
     async def _prepare_prompt_for_role(
         self,
         request: CLinkRequest,
+        client: ResolvedCLIClient,
         role: ResolvedCLIRole,
         *,
         system_prompt: str,
@@ -284,7 +293,7 @@ class CLinkTool(SimpleTool):
         self._active_system_prompt = system_prompt
         try:
             user_content = self.handle_prompt_file_with_fallback(request).strip()
-            guidance = self._agent_capabilities_guidance()
+            guidance = self._agent_capabilities_guidance(client)
             file_section = self._format_file_references(self.get_request_files(request))
 
             sections: list[str] = []
@@ -319,6 +328,9 @@ class CLinkTool(SimpleTool):
             "parser": result.parser_name,
             "return_code": result.returncode,
         }
+        partner_model = self._configured_partner_model(client)
+        if partner_model:
+            metadata["partner_model"] = partner_model
         metadata.update(result.parsed.metadata)
 
         if result.stderr.strip():
@@ -430,6 +442,9 @@ class CLinkTool(SimpleTool):
             "cli_name": client.name,
             "return_code": exc.returncode,
         }
+        partner_model = self._configured_partner_model(client)
+        if partner_model:
+            metadata["partner_model"] = partner_model
         if exc.stdout:
             metadata["stdout"] = exc.stdout.strip()
         if exc.stderr:
@@ -440,13 +455,60 @@ class CLinkTool(SimpleTool):
         error_output = ToolOutput(status="error", content=message, content_type="text", metadata=metadata)
         raise ToolExecutionError(error_output.model_dump_json())
 
-    def _agent_capabilities_guidance(self) -> str:
-        return (
-            "You are operating through the Gemini CLI agent. You have access to your full suite of "
-            "CLI capabilities—including launching web searches, reading files, and using any other "
-            "available tools. Gather current information yourself and deliver the final answer without "
-            "asking the PAL MCP host to perform searches or file reads."
+    def _agent_capabilities_guidance(self, client: ResolvedCLIClient) -> str:
+        runner_name = (client.runner or client.name).lower()
+        partner_model = self._configured_partner_model(client)
+        display_names = {
+            "claude": "Claude Code CLI agent",
+            "codex": "Codex CLI agent",
+            "gemini": "Gemini CLI agent",
+        }
+        display_name = display_names.get(runner_name, f"{client.name} CLI agent")
+
+        capability_notes = {
+            "claude": (
+                "Use Claude Code's repository tools to inspect files, run focused commands, reason about plans and "
+                "reviews, and make edits only when the role prompt or user request explicitly calls for implementation."
+            ),
+            "codex": (
+                "Use Codex CLI's repository tools to inspect files, run focused commands, review code, and make edits "
+                "only when the role prompt or user request explicitly calls for implementation."
+            ),
+            "gemini": (
+                "Use Gemini CLI's available tools, including file access, shell commands, and web/search capabilities "
+                "when they are available and relevant."
+            ),
+        }
+        capability_note = capability_notes.get(
+            runner_name,
+            "Use your available CLI tools to inspect files, run focused commands, and gather the context needed.",
         )
+
+        partner_identity = (
+            f" You are the Claude {partner_model.title()} Clink partner model."
+            if runner_name == "claude" and partner_model
+            else ""
+        )
+
+        return (
+            f"You are operating through the {display_name}.{partner_identity} {capability_note} "
+            "You are collaborating with the calling PAL MCP host agent; gather needed context yourself and deliver "
+            "the final answer directly without asking the host to perform searches or file reads."
+        )
+
+    @staticmethod
+    def _configured_partner_model(client: ResolvedCLIClient) -> str | None:
+        """Return the one explicit client-level model selection, if valid."""
+        model_positions = [index for index, arg in enumerate(client.config_args) if arg == "--model"]
+        if len(model_positions) != 1:
+            return None
+        model_index = model_positions[0] + 1
+        if model_index >= len(client.config_args):
+            return None
+        model_name = client.config_args[model_index].strip()
+        if not model_name or model_name.startswith("-"):
+            return None
+        return model_name
 
     def _build_progress_callback(self, cli_name: str):
         """Return an async callback that forwards CLI stdio lines as MCP progress.

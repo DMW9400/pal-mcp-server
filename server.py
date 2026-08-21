@@ -289,8 +289,8 @@ PROMPT_TEMPLATES = {
     },
     "clink": {
         "name": "clink",
-        "description": "Forward a request to a configured AI CLI (e.g., Gemini)",
-        "template": "Use clink with cli_name=<cli> to run this prompt",
+        "description": "Forward a request to a configured AI CLI (Claude Code, Codex, Gemini)",
+        "template": "Use clink with cli_name=<cli> and role=<role> to run this prompt",
     },
     "thinkdeep": {
         "name": "thinkdeeper",
