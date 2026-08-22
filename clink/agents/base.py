@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import shlex
 import shutil
 import tempfile
@@ -18,6 +19,61 @@ from clink.models import ResolvedCLIClient, ResolvedCLIRole
 from clink.parsers import BaseParser, ParsedCLIResponse, ParserError, get_parser
 
 logger = logging.getLogger("clink.agent")
+
+_PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
+
+
+def _template_part_regex(part: str) -> re.Pattern[str]:
+    """Compile an argv template part into a matcher, with placeholders wild.
+
+    'model_reasoning_effort="{effort}"' matches any effort value but never an
+    unrelated ``-c`` payload, so stripping a pinned override cannot clobber
+    other config arguments.
+    """
+
+    pieces: list[str] = []
+    pos = 0
+    for match in _PLACEHOLDER_RE.finditer(part):
+        pieces.append(re.escape(part[pos : match.start()]))
+        pieces.append(".*")
+        pos = match.end()
+    pieces.append(re.escape(part[pos:]))
+    return re.compile("".join(pieces))
+
+
+def render_arg_template(template: Sequence[str], values: dict[str, str]) -> list[str]:
+    """Substitute {placeholders} in an argv template."""
+
+    rendered: list[str] = []
+    for part in template:
+        for key, value in values.items():
+            part = part.replace("{" + key + "}", value)
+        rendered.append(part)
+    return rendered
+
+
+def strip_templated_args(args: Sequence[str], template: Sequence[str]) -> list[str]:
+    """Remove arguments already matching ``template`` so an override replaces
+    the configured pin instead of appending a second, conflicting flag."""
+
+    if not template:
+        return list(args)
+
+    if len(template) == 1:
+        pattern = _template_part_regex(template[0])
+        return [arg for arg in args if not pattern.fullmatch(arg)]
+
+    flag = template[0]
+    value_pattern = _template_part_regex(template[1])
+    out: list[str] = []
+    index = 0
+    while index < len(args):
+        if args[index] == flag and index + 1 < len(args) and value_pattern.fullmatch(args[index + 1]):
+            index += 2
+            continue
+        out.append(args[index])
+        index += 1
+    return out
 
 
 # Async callback invoked for each subprocess output event so callers (e.g. the clink
@@ -67,12 +123,19 @@ class BaseCLIAgent:
         files: Sequence[str],
         images: Sequence[str],
         on_event: EventCallback | None = None,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> AgentOutput:
         # Files and images are already embedded into the prompt by the tool; they are
         # accepted here only to keep parity with SimpleTool callers.
         _ = (files, images)
         # The runner simply executes the configured CLI command for the selected role.
         command = self._build_command(role=role, system_prompt=system_prompt)
+        command = self._apply_runtime_overrides(
+            command,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
         env = self._build_environment()
 
         # Resolve executable path for cross-platform compatibility (especially Windows)
@@ -261,6 +324,43 @@ class BaseCLIAgent:
         )
         await process.wait()
         return "".join(stdout_chunks), "".join(stderr_chunks)
+
+    def _apply_runtime_overrides(
+        self,
+        command: Sequence[str],
+        *,
+        model: str | None,
+        reasoning_effort: str | None,
+    ) -> list[str]:
+        """Apply per-call model / reasoning-effort overrides to a built command.
+
+        Runs after ``_build_command`` so subclass command builders inherit it.
+        The prompt is delivered on stdin, so appending flags is safe. Raises
+        rather than silently ignoring an unsupported override — a silent
+        fallback to the configured pin is the exact failure this guards.
+        """
+
+        result = list(command)
+        overrides: list[str] = []
+
+        if model:
+            template = self.client.model_arg_template
+            if not template:
+                raise CLIAgentError(f"CLI '{self.client.name}' does not support a per-call model override")
+            result = strip_templated_args(result, template)
+            overrides.extend(render_arg_template(template, {"model": model}))
+
+        if reasoning_effort:
+            template = self.client.reasoning_effort_arg_template
+            if not template:
+                raise CLIAgentError(
+                    f"CLI '{self.client.name}' does not support a per-call reasoning-effort override"
+                )
+            result = strip_templated_args(result, template)
+            overrides.extend(render_arg_template(template, {"effort": reasoning_effort}))
+
+        result.extend(overrides)
+        return result
 
     def _build_command(self, *, role: ResolvedCLIRole, system_prompt: str | None) -> list[str]:
         base = list(self.client.executable)

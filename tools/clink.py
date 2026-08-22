@@ -50,6 +50,14 @@ class CLinkRequest(BaseModel):
         default=None,
         description=COMMON_FIELD_DESCRIPTIONS["continuation_id"],
     )
+    model: str | None = Field(
+        default=None,
+        description="Override the CLI's configured model for this call (e.g. 'gpt-5.6-terra').",
+    )
+    reasoning_effort: str | None = Field(
+        default=None,
+        description="Override the CLI's configured reasoning effort for this call (e.g. 'low', 'medium', 'high').",
+    )
 
 
 class CLinkTool(SimpleTool):
@@ -148,6 +156,21 @@ class CLinkTool(SimpleTool):
             "absolute_file_paths": SchemaBuilder.SIMPLE_FIELD_SCHEMAS["absolute_file_paths"],
             "images": SchemaBuilder.COMMON_FIELD_SCHEMAS["images"],
             "continuation_id": SchemaBuilder.COMMON_FIELD_SCHEMAS["continuation_id"],
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional per-call model override for the selected CLI, replacing its configured "
+                    "pin for this call only (e.g. 'gpt-5.6-terra'). Omit to use the configured model."
+                ),
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "description": (
+                    "Optional per-call reasoning-effort override for the selected CLI, replacing its "
+                    "configured pin for this call only (commonly 'low', 'medium', or 'high'). "
+                    "Omit to use the configured effort."
+                ),
+            },
         }
 
         schema = {
@@ -219,6 +242,8 @@ class CLinkTool(SimpleTool):
                 files=absolute_file_paths,
                 images=images,
                 on_event=on_event,
+                model=request.model,
+                reasoning_effort=request.reasoning_effort,
             )
         except CLIAgentError as exc:
             metadata = self._build_error_metadata(client_config, exc)

@@ -139,6 +139,20 @@ class ClinkRegistry:
         internal_args = list(internal_defaults.additional_args) if internal_defaults else []
         config_args = list(raw.additional_args)
 
+        # Per-call model / reasoning-effort override templates. An explicit
+        # template in the client JSON wins; otherwise fall back to the CLI's
+        # internal default. Empty means the CLI supports no such override.
+        model_arg_template = (
+            list(raw.model_arg_template)
+            if raw.model_arg_template is not None
+            else (list(internal_defaults.model_arg_template) if internal_defaults else [])
+        )
+        reasoning_effort_arg_template = (
+            list(raw.reasoning_effort_arg_template)
+            if raw.reasoning_effort_arg_template is not None
+            else (list(internal_defaults.reasoning_effort_arg_template) if internal_defaults else [])
+        )
+
         timeout_seconds = raw.timeout_seconds or (
             internal_defaults.timeout_seconds if internal_defaults else DEFAULT_TIMEOUT_SECONDS
         )
@@ -169,6 +183,8 @@ class ClinkRegistry:
             roles=roles,
             output_to_file=output_to_file,
             working_dir=working_dir,
+            model_arg_template=model_arg_template,
+            reasoning_effort_arg_template=reasoning_effort_arg_template,
         )
 
     def _resolve_executable(

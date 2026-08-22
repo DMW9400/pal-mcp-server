@@ -51,6 +51,25 @@ class CLIClientConfig(BaseModel):
     timeout_seconds: PositiveInt | None = Field(default=None)
     roles: dict[str, CLIRoleConfig] = Field(default_factory=dict)
     output_to_file: OutputCaptureConfig | None = None
+    model_arg_template: list[str] | None = Field(
+        default=None,
+        description="Argv template for a per-call model override, e.g. ['--model', '{model}']. Overrides the CLI's internal default.",
+    )
+    reasoning_effort_arg_template: list[str] | None = Field(
+        default=None,
+        description="Argv template for a per-call reasoning-effort override, e.g. ['-c', 'model_reasoning_effort=\"{effort}\"'].",
+    )
+
+    @field_validator("model_arg_template", "reasoning_effort_arg_template", mode="before")
+    @classmethod
+    def _ensure_template_list(cls, value: Any) -> list[str] | None:
+        if value is None:
+            return None
+        if isinstance(value, list):
+            return [str(item) for item in value]
+        if isinstance(value, str):
+            return [value]
+        raise TypeError("arg templates must be a list of strings or a single string")
 
     @field_validator("additional_args", mode="before")
     @classmethod
@@ -87,6 +106,14 @@ class ResolvedCLIClient(BaseModel):
     runner: str | None = None
     roles: dict[str, ResolvedCLIRole]
     output_to_file: OutputCaptureConfig | None = None
+    model_arg_template: list[str] = Field(default_factory=list)
+    reasoning_effort_arg_template: list[str] = Field(default_factory=list)
+
+    def supports_model_override(self) -> bool:
+        return bool(self.model_arg_template)
+
+    def supports_reasoning_effort_override(self) -> bool:
+        return bool(self.reasoning_effort_arg_template)
 
     def list_roles(self) -> list[str]:
         return list(self.roles.keys())

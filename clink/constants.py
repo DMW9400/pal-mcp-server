@@ -24,6 +24,11 @@ class CLIInternalDefaults:
     default_role_prompt: str | None = None
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
     runner: str | None = None
+    # Argv templates used to apply per-call model / reasoning-effort overrides.
+    # "{model}" / "{effort}" are substituted at launch time. An empty template
+    # means the CLI does not support that override.
+    model_arg_template: list[str] = field(default_factory=list)
+    reasoning_effort_arg_template: list[str] = field(default_factory=list)
 
 
 INTERNAL_DEFAULTS: dict[str, CLIInternalDefaults] = {
@@ -32,17 +37,21 @@ INTERNAL_DEFAULTS: dict[str, CLIInternalDefaults] = {
         additional_args=["-o", "json"],
         default_role_prompt="systemprompts/clink/default.txt",
         runner="gemini",
+        model_arg_template=["-m", "{model}"],
     ),
     "codex": CLIInternalDefaults(
         parser="codex_jsonl",
         additional_args=["exec"],
         default_role_prompt="systemprompts/clink/default.txt",
         runner="codex",
+        model_arg_template=["--model", "{model}"],
+        reasoning_effort_arg_template=["-c", 'model_reasoning_effort="{effort}"'],
     ),
     "claude": CLIInternalDefaults(
         parser="claude_json",
         additional_args=["--print", "--output-format", "json"],
         default_role_prompt="systemprompts/clink/default.txt",
         runner="claude",
+        model_arg_template=["--model", "{model}"],
     ),
 }
