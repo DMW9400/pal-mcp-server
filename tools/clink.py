@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import datetime, timezone
@@ -79,6 +80,7 @@ class CLinkTool(SimpleTool):
         else:
             self._default_cli_name = self._cli_names[0] if self._cli_names else None
         self._active_system_prompt: str = ""
+        self._background_tasks: set[asyncio.Task] = set()
         super().__init__()
 
     def get_name(self) -> str:
@@ -234,8 +236,17 @@ class CLinkTool(SimpleTool):
 
         agent = create_agent(client_config)
         on_event = self._build_progress_callback(client_config.name)
-        try:
-            result = await agent.run(
+
+        # Ensure the conversation thread exists BEFORE the CLI launches. MCP clients
+        # can time out and cancel long-running calls; with the thread (and its ID in
+        # the activity log) created up front, the salvage path below can attach the
+        # CLI's eventual result to it, making a timed-out call recoverable via a
+        # follow-up request with this continuation_id.
+        thread_id = continuation_id or self._create_recovery_thread(request)
+        self._log_run_started(client_config.name, thread_id)
+
+        run_task = asyncio.create_task(
+            agent.run(
                 role=role_config,
                 prompt=prompt_text,
                 system_prompt=system_prompt_text if system_prompt_text.strip() else None,
@@ -245,8 +256,16 @@ class CLinkTool(SimpleTool):
                 model=request.model,
                 reasoning_effort=request.reasoning_effort,
             )
+        )
+        try:
+            result = await asyncio.shield(run_task)
+        except asyncio.CancelledError:
+            self._salvage_cancelled_run(run_task, client_config, request, thread_id)
+            raise
         except CLIAgentError as exc:
             metadata = self._build_error_metadata(client_config, exc)
+            if thread_id:
+                metadata["continuation_id"] = thread_id
             self._raise_tool_error(
                 f"CLI '{client_config.name}' execution failed: {exc}",
                 metadata=metadata,
@@ -272,7 +291,7 @@ class CLinkTool(SimpleTool):
             except Exception:
                 logger.debug("Failed to record assistant turn for continuation %s", continuation_id, exc_info=True)
 
-        continuation_offer = self._create_continuation_offer(request, model_info)
+        continuation_offer = self._continuation_offer_for_thread(thread_id)
         if continuation_offer:
             tool_output = self._create_continuation_offer_response(
                 content,
@@ -290,6 +309,135 @@ class CLinkTool(SimpleTool):
             )
 
         return [TextContent(type="text", text=tool_output.model_dump_json())]
+
+    def _create_recovery_thread(self, request: CLinkRequest) -> str | None:
+        """Create the conversation thread (with the user's turn) ahead of the CLI run.
+
+        Historically the thread was created only after the CLI returned, so a call
+        cancelled by the MCP client left no continuation to resume. Creating it up
+        front means the ID is known (and logged) for the whole lifetime of the run.
+        """
+        try:
+            from utils.conversation_memory import add_turn, create_thread
+
+            thread_id = create_thread(tool_name=self.get_name(), initial_request=self.get_request_as_dict(request))
+            add_turn(
+                thread_id,
+                "user",
+                self.get_request_prompt(request),
+                files=self.get_request_files(request),
+                images=self.get_request_images(request),
+                tool_name=self.get_name(),
+            )
+            return thread_id
+        except Exception:
+            logger.warning("Failed to create clink conversation thread ahead of CLI launch", exc_info=True)
+            return None
+
+    def _continuation_offer_for_thread(self, thread_id: str | None) -> dict[str, Any] | None:
+        """Build a continuation offer from the already-existing thread."""
+        if not thread_id:
+            return None
+        try:
+            from utils.conversation_memory import MAX_CONVERSATION_TURNS, get_thread
+
+            context = get_thread(thread_id)
+            if context is None:
+                return None
+            turn_count = len(context.turns)
+            if turn_count >= MAX_CONVERSATION_TURNS - 1:
+                return None
+            remaining_turns = MAX_CONVERSATION_TURNS - turn_count - 1
+            return {
+                "continuation_id": thread_id,
+                "remaining_turns": remaining_turns,
+                "note": f"You can continue this conversation for {remaining_turns} more exchanges.",
+            }
+        except Exception:
+            return None
+
+    def _log_run_started(self, cli_name: str, thread_id: str | None) -> None:
+        if not thread_id:
+            return
+        message = f"CLINK_RUN_STARTED: cli={cli_name} continuation_id={thread_id}"
+        logger.info(message)
+        try:
+            logging.getLogger("mcp_activity").info(message)
+        except Exception:  # pragma: no cover - logging must never break execution
+            pass
+
+    def _salvage_cancelled_run(
+        self,
+        run_task: asyncio.Task,
+        client: ResolvedCLIClient,
+        request: CLinkRequest,
+        thread_id: str | None,
+    ) -> None:
+        """Supervise a CLI run whose MCP request was cancelled (e.g. client timeout).
+
+        The run task is shielded from the request's cancellation, so the CLI child
+        keeps running here under supervision: the agent's own wait_for still kills
+        the process at the configured timeout, and if the run completes its result
+        is recorded on the pre-created continuation thread so a follow-up call with
+        that continuation_id retrieves the work instead of losing it.
+
+        Must stay synchronous: it runs inside an already-cancelled scope where any
+        await would immediately re-raise CancelledError.
+        """
+        cli_name = client.name
+        notice = (
+            f"CLINK_CANCELLED: cli={cli_name} continuation_id={thread_id or 'unavailable'} - "
+            "letting the CLI finish in the background; the result will be stored on the continuation thread"
+        )
+        logger.warning(notice)
+        try:
+            logging.getLogger("mcp_activity").info(notice)
+        except Exception:  # pragma: no cover - logging must never break execution
+            pass
+
+        async def _salvage() -> None:
+            try:
+                result = await run_task
+            except asyncio.CancelledError:
+                return
+            except CLIAgentError as exc:
+                logger.warning("clink CLI '%s' failed after client cancellation: %s", cli_name, exc)
+                return
+            except Exception:
+                logger.warning("clink CLI '%s' raised after client cancellation", cli_name, exc_info=True)
+                return
+
+            if not thread_id:
+                logger.warning(
+                    "clink CLI '%s' finished after client cancellation but no continuation thread exists; "
+                    "its result was dropped",
+                    cli_name,
+                )
+                return
+
+            model_info = {
+                "provider": cli_name,
+                "model_name": result.parsed.metadata.get("model_used"),
+            }
+            try:
+                self._record_assistant_turn(thread_id, result.parsed.content, request, model_info)
+            except Exception:
+                logger.warning("Failed to store salvaged clink result for continuation %s", thread_id, exc_info=True)
+                return
+
+            salvaged = (
+                f"CLINK_SALVAGED: cli={cli_name} continuation_id={thread_id} "
+                f"duration={result.duration_seconds:.1f}s - call clink with this continuation_id to retrieve the result"
+            )
+            logger.info(salvaged)
+            try:
+                logging.getLogger("mcp_activity").info(salvaged)
+            except Exception:  # pragma: no cover - logging must never break execution
+                pass
+
+        task = asyncio.create_task(_salvage())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def prepare_prompt(self, request) -> str:
         selected_cli = request.cli_name or self._default_cli_name

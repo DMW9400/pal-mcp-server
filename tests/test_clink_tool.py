@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import pytest
@@ -387,3 +388,142 @@ async def test_clink_tool_truncates_without_summary(monkeypatch):
     assert metadata.get("output_truncated") is True
     assert metadata.get("events_removed_for_normal") is True
     assert metadata.get("output_original_length") == len(long_text)
+
+
+@pytest.mark.asyncio
+async def test_clink_tool_creates_thread_before_cli_run(monkeypatch):
+    """The continuation thread must exist (with the user turn) before the CLI starts."""
+    import utils.conversation_memory as conversation_memory
+
+    tool = CLinkTool()
+
+    created: dict[str, str] = {}
+    real_create_thread = conversation_memory.create_thread
+
+    def capture_create_thread(*args, **kwargs):
+        thread_id = real_create_thread(*args, **kwargs)
+        created["thread_id"] = thread_id
+        return thread_id
+
+    monkeypatch.setattr(conversation_memory, "create_thread", capture_create_thread)
+
+    observed: dict[str, object] = {}
+
+    class DummyAgent:
+        async def run(self, **kwargs):
+            thread_id = created.get("thread_id")
+            observed["thread_id"] = thread_id
+            observed["context"] = conversation_memory.get_thread(thread_id) if thread_id else None
+            return AgentOutput(
+                parsed=ParsedCLIResponse(content="Done", metadata={"model_used": "gpt-5.6-sol"}),
+                sanitized_command=["codex"],
+                returncode=0,
+                stdout="{}",
+                stderr="",
+                duration_seconds=0.1,
+                parser_name="codex_jsonl",
+                output_file_content=None,
+            )
+
+    monkeypatch.setattr("tools.clink.create_agent", lambda client: DummyAgent())
+
+    result = await tool.execute({"prompt": "Ping", "cli_name": "codex", "absolute_file_paths": [], "images": []})
+    payload = json.loads(result[0].text)
+
+    # Thread existed before the CLI ran, already holding the user's turn
+    assert observed["thread_id"] is not None
+    assert observed["context"] is not None
+    assert [turn.role for turn in observed["context"].turns] == ["user"]
+
+    # And the same thread is offered back to the caller for continuation
+    assert payload["status"] == "continuation_available"
+    assert payload["continuation_offer"]["continuation_id"] == observed["thread_id"]
+
+    # After completion the assistant turn is recorded on it
+    final_context = conversation_memory.get_thread(observed["thread_id"])
+    assert [turn.role for turn in final_context.turns] == ["user", "assistant"]
+    assert final_context.turns[-1].content == "Done"
+
+
+@pytest.mark.asyncio
+async def test_clink_tool_salvages_result_after_client_cancellation(monkeypatch):
+    """A cancelled MCP request lets the CLI finish and stores its result on the thread."""
+    import utils.conversation_memory as conversation_memory
+
+    tool = CLinkTool()
+
+    created: dict[str, str] = {}
+    real_create_thread = conversation_memory.create_thread
+
+    def capture_create_thread(*args, **kwargs):
+        thread_id = real_create_thread(*args, **kwargs)
+        created["thread_id"] = thread_id
+        return thread_id
+
+    monkeypatch.setattr(conversation_memory, "create_thread", capture_create_thread)
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class SlowAgent:
+        async def run(self, **kwargs):
+            started.set()
+            await release.wait()
+            return AgentOutput(
+                parsed=ParsedCLIResponse(content="Late result", metadata={"model_used": "gpt-5.6-sol"}),
+                sanitized_command=["codex"],
+                returncode=0,
+                stdout="{}",
+                stderr="",
+                duration_seconds=90.0,
+                parser_name="codex_jsonl",
+                output_file_content=None,
+            )
+
+    monkeypatch.setattr("tools.clink.create_agent", lambda client: SlowAgent())
+
+    exec_task = asyncio.create_task(
+        tool.execute({"prompt": "Long question", "cli_name": "codex", "absolute_file_paths": [], "images": []})
+    )
+    await started.wait()
+    exec_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await exec_task
+
+    # The CLI run survived the cancellation; let it finish and drain the salvage task
+    release.set()
+    for task in list(tool._background_tasks):
+        await task
+
+    context = conversation_memory.get_thread(created["thread_id"])
+    assert [turn.role for turn in context.turns] == ["user", "assistant"]
+    assert context.turns[-1].content == "Late result"
+
+
+@pytest.mark.asyncio
+async def test_clink_tool_error_metadata_includes_continuation_id(monkeypatch):
+    """Server-side CLI failures surface the pre-created continuation_id in metadata."""
+    from clink.agents import CLIAgentError
+    from tools.shared.exceptions import ToolExecutionError
+
+    tool = CLinkTool()
+
+    class FailingAgent:
+        async def run(self, **kwargs):
+            raise CLIAgentError("CLI 'codex' timed out after 1800 seconds")
+
+    monkeypatch.setattr("tools.clink.create_agent", lambda client: FailingAgent())
+
+    with pytest.raises(ToolExecutionError) as exc_info:
+        await tool.execute({"prompt": "Ping", "cli_name": "codex", "absolute_file_paths": [], "images": []})
+
+    payload = json.loads(str(exc_info.value))
+    assert payload["status"] == "error"
+    continuation_id = payload["metadata"]["continuation_id"]
+    assert continuation_id
+
+    import utils.conversation_memory as conversation_memory
+
+    context = conversation_memory.get_thread(continuation_id)
+    assert context is not None
+    assert [turn.role for turn in context.turns] == ["user"]
