@@ -22,6 +22,7 @@ from clink.models import (
     ResolvedCLIClient,
     ResolvedCLIRole,
 )
+from clink.policy import PartnerModelPolicyError, validate_command_policy
 from utils.env import get_env
 from utils.file_utils import read_json_file
 
@@ -171,7 +172,7 @@ class ClinkRegistry:
 
         output_to_file = raw.output_to_file
 
-        return ResolvedCLIClient(
+        resolved = ResolvedCLIClient(
             name=normalized_name,
             executable=executable,
             internal_args=internal_args,
@@ -186,6 +187,20 @@ class ClinkRegistry:
             model_arg_template=model_arg_template,
             reasoning_effort_arg_template=reasoning_effort_arg_template,
         )
+        try:
+            for role in resolved.roles.values():
+                validate_command_policy(
+                    resolved.name,
+                    [
+                        *resolved.executable,
+                        *resolved.internal_args,
+                        *resolved.config_args,
+                        *role.role_args,
+                    ],
+                )
+        except PartnerModelPolicyError as exc:
+            raise RegistryLoadError(f"Invalid immutable partner-model policy in {source_path}: {exc}") from exc
+        return resolved
 
     def _resolve_executable(
         self,

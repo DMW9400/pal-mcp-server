@@ -72,6 +72,10 @@ def test_registry_lists_roles():
     # Verify codex uses --enable web_search_request (not --search which is unsupported by exec)
     assert codex_client.config_args == [
         "--json",
+        "--model",
+        "gpt-5.6-sol",
+        "-c",
+        'model_reasoning_effort="high"',
         "--dangerously-bypass-approvals-and-sandbox",
         "--enable",
         "web_search_request",
@@ -226,12 +230,18 @@ async def test_clink_tool_forwards_progress_notifications(monkeypatch):
     await tool.execute(arguments)
 
     assert "on_event" in captured_kwargs and captured_kwargs["on_event"] is not None
-    assert len(progress_calls) == 3
-    assert progress_calls[0]["progress_token"] == "tok-123"
-    assert progress_calls[0]["progress"] == 1.0
-    assert "[gemini:stdout]" in progress_calls[0]["message"]
-    assert "[gemini:stderr]" in progress_calls[1]["message"]
-    assert progress_calls[2]["progress"] == 3.0
+    # First notification is the run-identity message (progress 0), then one per event.
+    assert len(progress_calls) == 4
+    assert progress_calls[0]["progress"] == 0.0
+    assert "run_id=" in progress_calls[0]["message"]
+    assert "clink_poll" in progress_calls[0]["message"]
+
+    stream_calls = progress_calls[1:]
+    assert stream_calls[0]["progress_token"] == "tok-123"
+    assert stream_calls[0]["progress"] == 1.0
+    assert "[gemini:stdout]" in stream_calls[0]["message"]
+    assert "[gemini:stderr]" in stream_calls[1]["message"]
+    assert stream_calls[2]["progress"] == 3.0
 
 
 @pytest.mark.asyncio

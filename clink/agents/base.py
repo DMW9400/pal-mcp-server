@@ -7,7 +7,7 @@ import logging
 import os
 import re
 import shlex
-import shutil
+import signal
 import tempfile
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -17,8 +17,18 @@ from pathlib import Path
 from clink.constants import DEFAULT_STREAM_LIMIT
 from clink.models import ResolvedCLIClient, ResolvedCLIRole
 from clink.parsers import BaseParser, ParsedCLIResponse, ParserError, get_parser
+from clink.policy import (
+    PartnerModelPolicyError,
+    attest_client,
+    validate_command_policy,
+    validate_request_policy,
+    verify_observed_policy,
+)
 
 logger = logging.getLogger("clink.agent")
+
+# Seconds of complete stdio silence before a synthetic heartbeat event is emitted.
+HEARTBEAT_INTERVAL_SECONDS = 20.0
 
 _PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
 
@@ -109,6 +119,9 @@ class CLIAgentError(RuntimeError):
 class BaseCLIAgent:
     """Execute a configured CLI command and parse its output."""
 
+    #: Overridable so tests can exercise the heartbeat without waiting 20 seconds.
+    heartbeat_interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS
+
     def __init__(self, client: ResolvedCLIClient):
         self.client = client
         self._parser: BaseParser = get_parser(client.parser)
@@ -136,17 +149,15 @@ class BaseCLIAgent:
             model=model,
             reasoning_effort=reasoning_effort,
         )
+        try:
+            validate_command_policy(self.client.name, command)
+            capability = attest_client(self.client, role)
+        except PartnerModelPolicyError as exc:
+            raise CLIAgentError(str(exc)) from exc
         env = self._build_environment()
 
         # Resolve executable path for cross-platform compatibility (especially Windows)
-        executable_name = command[0]
-        resolved_executable = shutil.which(executable_name)
-        if resolved_executable is None:
-            raise CLIAgentError(
-                f"Executable '{executable_name}' not found in PATH for CLI '{self.client.name}'. "
-                f"Ensure the command is installed and accessible."
-            )
-        command[0] = resolved_executable
+        command[0] = capability.executable
 
         sanitized_command = list(command)
 
@@ -186,6 +197,7 @@ class BaseCLIAgent:
                 cwd=cwd,
                 limit=limit,
                 env=env,
+                start_new_session=os.name == "posix",
             )
         except FileNotFoundError as exc:
             raise CLIAgentError(f"Executable not found for CLI '{self.client.name}': {exc}") from exc
@@ -195,12 +207,11 @@ class BaseCLIAgent:
                 self._stream_subprocess(process, prompt.encode("utf-8"), on_event),
                 timeout=self.client.timeout_seconds,
             )
+        except asyncio.CancelledError:
+            await self._kill_subprocess(process)
+            raise
         except asyncio.TimeoutError as exc:
-            process.kill()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=5)
-            except asyncio.TimeoutError:  # pragma: no cover - defensive
-                pass
+            await self._kill_subprocess(process)
             raise CLIAgentError(
                 f"CLI '{self.client.name}' timed out after {self.client.timeout_seconds} seconds",
                 returncode=None,
@@ -250,6 +261,16 @@ class BaseCLIAgent:
                 stderr=stderr_text,
             ) from exc
 
+        try:
+            verify_observed_policy(self.client.name, parsed.metadata)
+        except PartnerModelPolicyError as exc:
+            raise CLIAgentError(
+                str(exc),
+                returncode=return_code,
+                stdout=stdout_text,
+                stderr=stderr_text,
+            ) from exc
+
         return AgentOutput(
             parsed=parsed,
             sanitized_command=sanitized_command,
@@ -260,6 +281,24 @@ class BaseCLIAgent:
             parser_name=self._parser.name,
             output_file_content=output_file_content,
         )
+
+    async def _kill_subprocess(self, process) -> None:
+        """Kill the CLI process group and reap it before propagating cancellation."""
+        try:
+            pid = getattr(process, "pid", None)
+            if os.name == "posix" and pid:
+                os.killpg(pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except (OSError, ProcessLookupError, AttributeError):
+            try:
+                process.kill()
+            except (OSError, ProcessLookupError, AttributeError):
+                pass
+        try:
+            await asyncio.wait_for(asyncio.shield(process.wait()), timeout=5)
+        except asyncio.TimeoutError:  # pragma: no cover - defensive
+            pass
 
     async def _stream_subprocess(
         self,
@@ -273,9 +312,15 @@ class BaseCLIAgent:
         on_event (if provided). This keeps continuous stdio activity flowing
         through the MCP boundary so subagent watchdogs don't kill long calls
         during quiet stretches of the wrapped CLI subprocess.
+
+        A companion coroutine emits a synthetic "heartbeat" event after each
+        interval of complete silence. Heartbeats are never appended to the
+        captured stdout/stderr buffers.
         """
         stdout_chunks: list[str] = []
         stderr_chunks: list[str] = []
+        activity = asyncio.Event()
+        finished = asyncio.Event()
 
         async def feed_stdin() -> None:
             if process.stdin is None:  # pragma: no cover - defensive
@@ -310,6 +355,7 @@ class BaseCLIAgent:
                     break
                 decoded = line.decode("utf-8", errors="replace")
                 chunks.append(decoded)
+                activity.set()
                 if on_event is not None:
                     try:
                         await on_event(kind, decoded.rstrip("\r\n"))
@@ -317,11 +363,54 @@ class BaseCLIAgent:
                         # Never let progress-callback failures kill the run.
                         self._logger.debug("on_event callback raised", exc_info=True)
 
-        await asyncio.gather(
-            feed_stdin(),
-            drain_stream(process.stdout, stdout_chunks, "stdout"),
-            drain_stream(process.stderr, stderr_chunks, "stderr"),
-        )
+        async def emit_heartbeats() -> None:
+            if on_event is None:
+                return
+            interval = self.heartbeat_interval_seconds
+            if not interval or interval <= 0:
+                return
+            start = time.monotonic()
+            while not finished.is_set():
+                activity.clear()
+                waiters = [
+                    asyncio.ensure_future(activity.wait()),
+                    asyncio.ensure_future(finished.wait()),
+                ]
+                try:
+                    done, _pending = await asyncio.wait(
+                        waiters,
+                        timeout=interval,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    for waiter in waiters:
+                        waiter.cancel()
+                    await asyncio.gather(*waiters, return_exceptions=True)
+                if done:
+                    # Real output (or completion) resets the silence window.
+                    continue
+                elapsed = int(time.monotonic() - start)
+                try:
+                    await on_event("heartbeat", f"{self.client.name} still running; {elapsed}s elapsed")
+                except Exception:
+                    self._logger.debug("on_event heartbeat raised", exc_info=True)
+
+        heartbeat_task = asyncio.ensure_future(emit_heartbeats())
+        try:
+            await asyncio.gather(
+                feed_stdin(),
+                drain_stream(process.stdout, stdout_chunks, "stdout"),
+                drain_stream(process.stderr, stderr_chunks, "stderr"),
+            )
+        finally:
+            finished.set()
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # pragma: no cover - defensive
+                self._logger.debug("heartbeat task failed", exc_info=True)
         await process.wait()
         return "".join(stdout_chunks), "".join(stderr_chunks)
 
@@ -340,25 +429,30 @@ class BaseCLIAgent:
         fallback to the configured pin is the exact failure this guards.
         """
 
+        try:
+            validate_request_policy(self.client.name, model, reasoning_effort)
+        except PartnerModelPolicyError as exc:
+            raise CLIAgentError(str(exc)) from exc
+
+        # Claude and Codex pins are immutable. Exact redundant values are
+        # accepted for compatibility but never rewrite the attested command.
+        if self.client.name.lower() in {"claude", "codex"}:
+            return list(command)
+
         result = list(command)
         overrides: list[str] = []
-
         if model:
             template = self.client.model_arg_template
             if not template:
                 raise CLIAgentError(f"CLI '{self.client.name}' does not support a per-call model override")
             result = strip_templated_args(result, template)
             overrides.extend(render_arg_template(template, {"model": model}))
-
         if reasoning_effort:
             template = self.client.reasoning_effort_arg_template
             if not template:
-                raise CLIAgentError(
-                    f"CLI '{self.client.name}' does not support a per-call reasoning-effort override"
-                )
+                raise CLIAgentError(f"CLI '{self.client.name}' does not support a per-call reasoning-effort override")
             result = strip_templated_args(result, template)
             overrides.extend(render_arg_template(template, {"effort": reasoning_effort}))
-
         result.extend(overrides)
         return result
 

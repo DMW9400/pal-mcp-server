@@ -2,6 +2,7 @@
 
 import asyncio
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -86,7 +87,13 @@ def base_agent():
         name="codex",
         executable=["codex"],
         internal_args=["exec"],
-        config_args=["--json"],
+        config_args=[
+            "--json",
+            "--model",
+            "gpt-5.6-sol",
+            "-c",
+            'model_reasoning_effort="high"',
+        ],
         env={},
         timeout_seconds=30,
         parser="codex_jsonl",
@@ -101,8 +108,8 @@ async def _run(monkeypatch, agent, role, process, *, on_event=None):
     async def fake_create_subprocess_exec(*_args, **_kwargs):
         return process
 
-    def fake_which(name):
-        return f"/usr/bin/{name}"
+    def fake_which(_name, path=None):
+        return sys.executable
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
     monkeypatch.setattr(shutil, "which", fake_which)
@@ -212,4 +219,23 @@ async def test_timeout_kills_process_and_raises(monkeypatch, base_agent):
         await _run(monkeypatch, agent, role, process)
 
     assert "timed out" in str(excinfo.value)
+    assert process.killed is True
+
+
+@pytest.mark.asyncio
+async def test_task_cancellation_kills_and_reaps_cli(monkeypatch, base_agent):
+    agent, role = base_agent
+    entered = asyncio.Event()
+    process = DummyProcess(stdout=b"", returncode=0)
+
+    async def slow_stream(*_args, **_kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(agent, "_stream_subprocess", slow_stream)
+    task = asyncio.create_task(_run(monkeypatch, agent, role, process))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
     assert process.killed is True

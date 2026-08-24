@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.pal.clink-worker</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PAL_PYTHON__</string>
+    <string>-m</string>
+    <string>clink.worker</string>
+    <string>serve</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__PAL_ROOT__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key>
+    <string>__PAL_ROOT__</string>
+    <key>PATH</key>
+    <string>__PAL_PATH__</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>AbandonProcessGroup</key>
+  <false/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>__PAL_LOG_DIR__/clink-worker.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__PAL_LOG_DIR__/clink-worker.stderr.log</string>
+</dict>
+</plist>

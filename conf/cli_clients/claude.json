@@ -5,7 +5,9 @@
     "--permission-mode",
     "acceptEdits",
     "--model",
-    "fable"
+    "fable",
+    "--effort",
+    "xhigh"
   ],
   "env": {},
   "roles": {

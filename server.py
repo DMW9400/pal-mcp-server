@@ -51,6 +51,7 @@ from tools import (  # noqa: E402
     AnalyzeTool,
     ChallengeTool,
     ChatTool,
+    CLinkPollTool,
     CLinkTool,
     CodeReviewTool,
     ConsensusTool,
@@ -261,6 +262,7 @@ def filter_disabled_tools(all_tools: dict[str, Any]) -> dict[str, Any]:
 TOOLS = {
     "chat": ChatTool(),  # Interactive development chat and brainstorming
     "clink": CLinkTool(),  # Bridge requests to configured AI CLIs
+    "clink_poll": CLinkPollTool(),  # Fetch the durable result of a clink run by run_id
     "thinkdeep": ThinkDeepTool(),  # Step-by-step deep thinking workflow with expert analysis
     "planner": PlannerTool(),  # Interactive sequential planner using workflow architecture
     "consensus": ConsensusTool(),  # Step-by-step consensus workflow with multi-model analysis
@@ -689,8 +691,7 @@ async def handle_list_tools() -> list[Tool]:
     return tools
 
 
-@server.call_tool()
-async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+async def _handle_call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """
     Handle incoming tool execution requests from MCP clients.
 
@@ -748,6 +749,14 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextCon
     """
     logger.info(f"MCP tool call: {name}")
     logger.debug(f"MCP tool arguments: {list(arguments.keys())}")
+
+    # Tool-specific readiness must be proven before durable continuation
+    # admission. Clink uses this to attest the executable/config/model/effort
+    # tuple; failures consume no turn and launch no process.
+    candidate_tool = TOOLS.get(name)
+    if candidate_tool is not None and hasattr(candidate_tool, "preflight_continuation"):
+        arguments = await candidate_tool.preflight_continuation(dict(arguments))
+    arguments["_current_tool_name"] = name
 
     # Log to activity file for monitoring
     try:
@@ -876,6 +885,29 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextCon
     # Handle unknown tool requests gracefully
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
+
+
+@server.call_tool()
+async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    """Own the durable exchange failure boundary for the complete dispatch."""
+    from utils.conversation_memory import current_exchange_id, fail_exchange
+
+    try:
+        return await _handle_call_tool_impl(name, arguments)
+    except asyncio.CancelledError:
+        # Clink cancellation detaches only the MCP caller. Keep its durable
+        # exchange active so the supervised run can commit its answer later.
+        raise
+    except BaseException:
+        exchange_id = current_exchange_id.get()
+        if exchange_id:
+            try:
+                fail_exchange(exchange_id, "dispatch_failed")
+            except Exception:
+                logger.warning("Failed to terminalize durable exchange %s", exchange_id, exc_info=True)
+        raise
+    finally:
+        current_exchange_id.set(None)
 
 
 def parse_model_option(model_string: str) -> tuple[str, Optional[str]]:
@@ -1044,7 +1076,13 @@ async def reconstruct_thread_context(arguments: dict[str, Any]) -> dict[str, Any
         4. Debug tool can reference specific findings from analyze tool
         5. Natural cross-tool collaboration without context loss
     """
-    from utils.conversation_memory import add_turn, build_conversation_history, get_thread
+    from utils.conversation_memory import (
+        CONVERSATION_TIMEOUT_HOURS,
+        begin_exchange,
+        build_conversation_history,
+        current_exchange_id,
+        get_thread,
+    )
 
     continuation_id = arguments["continuation_id"]
 
@@ -1065,14 +1103,16 @@ async def reconstruct_thread_context(arguments: dict[str, Any]) -> dict[str, Any
         # Return error asking CLI to restart conversation with full context
         raise ValueError(
             f"Conversation thread '{continuation_id}' was not found or has expired. "
-            f"This may happen if the conversation was created more than 3 hours ago or if the "
-            f"server was restarted. "
+            f"This may happen if the conversation was created more than {CONVERSATION_TIMEOUT_HOURS} hours ago "
+            f"or if the server was restarted. "
             f"Please restart the conversation by providing your full question/prompt without the "
             f"continuation_id parameter. "
             f"This will create a new conversation thread that can continue with follow-up exchanges."
         )
 
-    # Add user's new input to the conversation
+    # Atomically claim the conversation and append the user turn. The returned
+    # snapshot intentionally excludes the just-admitted user input; it is added
+    # once below as NEW USER INPUT.
     user_prompt = arguments.get("prompt", "")
     if user_prompt:
         # Capture files referenced in this turn
@@ -1085,12 +1125,24 @@ async def reconstruct_thread_context(arguments: dict[str, Any]) -> dict[str, Any
             f"[CONVERSATION_DEBUG] User prompt length: {len(user_prompt)} chars (~{user_prompt_tokens:,} tokens)"
         )
         logger.debug(f"[CONVERSATION_DEBUG] User files: {user_files}")
-        success = add_turn(continuation_id, "user", user_prompt, files=user_files)
-        if not success:
-            logger.warning(f"Failed to add user turn to thread {continuation_id}")
-            logger.debug("[CONVERSATION_DEBUG] Failed to add user turn - thread may be at turn limit or expired")
-        else:
-            logger.debug(f"[CONVERSATION_DEBUG] Successfully added user turn to thread {continuation_id}")
+        admission = begin_exchange(
+            continuation_id,
+            tool_name=arguments.get("_current_tool_name") or context.tool_name,
+            content=user_prompt,
+            files=user_files,
+            images=arguments.get("images") or [],
+            idempotency_key=arguments.get("idempotency_key"),
+            capability_digest=arguments.get("_capability_digest"),
+        )
+        context = admission["pre_user_thread"]
+        arguments["_exchange_id"] = admission["exchange_id"]
+        if admission.get("idempotent"):
+            arguments["_idempotent_replay"] = True
+            arguments["_idempotent_run_id"] = admission.get("run_id")
+            arguments["_idempotent_thread_id"] = continuation_id
+        if admission["exchange_id"]:
+            current_exchange_id.set(admission["exchange_id"])
+        logger.debug(f"[CONVERSATION_DEBUG] Admitted durable exchange for thread {continuation_id}")
 
     # Create model context early to use for history building
     from utils.model_context import ModelContext

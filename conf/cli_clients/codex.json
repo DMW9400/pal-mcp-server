@@ -5,6 +5,8 @@
     "--json",
     "--model",
     "gpt-5.6-sol",
+    "-c",
+    "model_reasoning_effort=\"high\"",
     "--dangerously-bypass-approvals-and-sandbox",
     "--enable",
     "web_search_request"

@@ -691,7 +691,9 @@ class SimpleTool(BaseTool):
         from tools.models import ContinuationOffer, ToolOutput
 
         try:
-            if not self.get_request_continuation_id(request):
+            from utils.conversation_memory import current_exchange_id
+
+            if not self.get_request_continuation_id(request) and not current_exchange_id.get():
                 self._record_assistant_turn(
                     continuation_data["continuation_id"],
                     content,
@@ -742,7 +744,7 @@ class SimpleTool(BaseTool):
         if not continuation_id:
             return
 
-        from utils.conversation_memory import add_turn
+        from utils.conversation_memory import add_turn, complete_exchange, current_exchange_id
 
         model_provider = None
         model_name = None
@@ -762,6 +764,20 @@ class SimpleTool(BaseTool):
             model_response = model_info.get("model_response")
             if model_response:
                 model_metadata = {"usage": model_response.usage, "metadata": model_response.metadata}
+
+        exchange_id = current_exchange_id.get()
+        if exchange_id:
+            complete_exchange(
+                exchange_id,
+                content=response_text,
+                files=self.get_request_files(request),
+                images=self.get_request_images(request),
+                tool_name=self.get_name(),
+                model_provider=model_provider,
+                model_name=model_name,
+                model_metadata=model_metadata,
+            )
+            return
 
         add_turn(
             continuation_id,

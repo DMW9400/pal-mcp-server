@@ -102,9 +102,15 @@ class ClaudeJSONParser(BaseParser):
 
         model_usage = payload.get("modelUsage")
         if isinstance(model_usage, dict) and model_usage:
+            if len(model_usage) != 1:
+                raise ParserError("Claude CLI reported multiple models in one run")
             metadata["model_usage"] = model_usage
             first_model = next(iter(model_usage.keys()))
             metadata["model_used"] = first_model
+
+        effort = payload.get("effort") or payload.get("reasoning_effort")
+        if isinstance(effort, str) and effort:
+            metadata["reasoning_effort_used"] = effort
 
         permission_denials = payload.get("permission_denials")
         if isinstance(permission_denials, list) and permission_denials:

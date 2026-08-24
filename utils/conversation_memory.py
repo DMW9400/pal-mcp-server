@@ -104,6 +104,7 @@ This enables true AI-to-AI collaboration across the entire tool ecosystem with o
 context preservation and natural conversation understanding.
 """
 
+import contextvars
 import logging
 import os
 import uuid
@@ -115,6 +116,10 @@ from pydantic import BaseModel
 from utils.env import get_env
 
 logger = logging.getLogger(__name__)
+
+current_exchange_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "pal_current_exchange_id", default=None
+)
 
 # Configuration constants
 # Get max conversation turns from environment, default to 20 turns (10 exchanges)
@@ -212,12 +217,30 @@ def get_storage():
     Returns:
         InMemoryStorage: Thread-safe in-memory storage backend
     """
-    from .storage_backend import get_storage_backend
+    backend = (get_env("PAL_CONVERSATION_BACKEND", "sqlite") or "sqlite").strip().lower()
+    if backend == "memory":
+        from .storage_backend import get_storage_backend
 
-    return get_storage_backend()
+        return get_storage_backend()
+    if backend != "sqlite":
+        raise RuntimeError("PAL_CONVERSATION_BACKEND must be 'sqlite' or 'memory'")
+    from .sqlite_conversation_storage import get_default_storage
+
+    return get_default_storage()
 
 
-def create_thread(tool_name: str, initial_request: dict[str, Any], parent_thread_id: Optional[str] = None) -> str:
+def is_durable_storage(storage: Any) -> bool:
+    from .sqlite_conversation_storage import SQLiteConversationStorage
+
+    return isinstance(storage, SQLiteConversationStorage)
+
+
+def create_thread(
+    tool_name: str,
+    initial_request: dict[str, Any],
+    parent_thread_id: Optional[str] = None,
+    initial_idempotency_key: str | None = None,
+) -> str:
     """
     Create new conversation thread and return thread ID
 
@@ -259,8 +282,18 @@ def create_thread(tool_name: str, initial_request: dict[str, Any], parent_thread
         initial_context=filtered_context,
     )
 
-    # Store in memory with configurable TTL to prevent indefinite accumulation
     storage = get_storage()
+    if is_durable_storage(storage):
+        return storage.create_thread(
+            tool_name=tool_name,
+            initial_context=filtered_context,
+            parent_thread_id=parent_thread_id,
+            thread_id=thread_id,
+            ttl_seconds=CONVERSATION_TIMEOUT_SECONDS,
+            initial_idempotency_key=initial_idempotency_key,
+        )
+
+    # Compatibility backend for explicitly selected in-memory/test storage.
     key = f"thread:{thread_id}"
     storage.setex(key, CONVERSATION_TIMEOUT_SECONDS, context.model_dump_json())
 
@@ -294,6 +327,9 @@ def get_thread(thread_id: str) -> Optional[ThreadContext]:
 
     try:
         storage = get_storage()
+        if is_durable_storage(storage):
+            data = storage.load_thread(thread_id)
+            return ThreadContext.model_validate(data) if data else None
         key = f"thread:{thread_id}"
         data = storage.get(key)
 
@@ -374,18 +410,109 @@ def add_turn(
         model_metadata=model_metadata,  # Additional model info
     )
 
-    context.turns.append(turn)
-    context.last_updated_at = datetime.now(timezone.utc).isoformat()
-
-    # Save back to storage and refresh TTL
     try:
         storage = get_storage()
+        if is_durable_storage(storage):
+            return storage.append_legacy_turn(
+                thread_id,
+                turn.model_dump(mode="json"),
+                CONVERSATION_TIMEOUT_SECONDS,
+                MAX_CONVERSATION_TURNS,
+            )
+
+        context.turns.append(turn)
+        context.last_updated_at = datetime.now(timezone.utc).isoformat()
         key = f"thread:{thread_id}"
         storage.setex(key, CONVERSATION_TIMEOUT_SECONDS, context.model_dump_json())  # Refresh TTL to configured timeout
         return True
     except Exception as e:
         logger.debug(f"[FLOW] Failed to save turn to storage: {type(e).__name__}")
         return False
+
+
+def begin_exchange(
+    thread_id: str,
+    *,
+    tool_name: str,
+    content: str,
+    files: Optional[list[str]] = None,
+    images: Optional[list[str]] = None,
+    idempotency_key: str | None = None,
+    capability_digest: str | None = None,
+    owner_instance_id: str | None = None,
+):
+    """Atomically claim a thread and insert one user turn with assistant capacity reserved."""
+    storage = get_storage()
+    if not is_durable_storage(storage):
+        context = get_thread(thread_id)
+        if not context or not add_turn(thread_id, "user", content, files=files, images=images, tool_name=tool_name):
+            raise ValueError("conversation could not accept a new exchange")
+        return {"exchange_id": None, "pre_user_thread": context, "idempotent": False}
+    turn = ConversationTurn(
+        role="user",
+        content=content,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        files=files,
+        images=images,
+        tool_name=tool_name,
+    )
+    admission = storage.begin_exchange(
+        thread_id,
+        tool_name,
+        turn.model_dump(mode="json"),
+        client_idempotency_key=idempotency_key,
+        owner_instance_id=owner_instance_id,
+        capability_digest=capability_digest,
+        ttl_seconds=CONVERSATION_TIMEOUT_SECONDS,
+        max_turns=MAX_CONVERSATION_TURNS,
+    )
+    return {
+        "exchange_id": admission.exchange_id,
+        "pre_user_thread": ThreadContext.model_validate(admission.pre_user_thread),
+        "idempotent": admission.idempotent,
+        "run_id": admission.run_id,
+    }
+
+
+def complete_exchange(
+    exchange_id: str,
+    *,
+    content: str,
+    files: Optional[list[str]] = None,
+    images: Optional[list[str]] = None,
+    tool_name: Optional[str] = None,
+    model_provider: Optional[str] = None,
+    model_name: Optional[str] = None,
+    model_metadata: Optional[dict[str, Any]] = None,
+    run_terminal: dict[str, Any] | None = None,
+) -> bool:
+    turn = ConversationTurn(
+        role="assistant",
+        content=content,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        files=files,
+        images=images,
+        tool_name=tool_name,
+        model_provider=model_provider,
+        model_name=model_name,
+        model_metadata=model_metadata,
+    )
+    storage = get_storage()
+    return storage.complete_exchange(
+        exchange_id,
+        turn.model_dump(mode="json"),
+        run_terminal=run_terminal,
+        ttl_seconds=CONVERSATION_TIMEOUT_SECONDS,
+    )
+
+
+def fail_exchange(exchange_id: str | None, category: str) -> bool:
+    if not exchange_id:
+        return False
+    storage = get_storage()
+    if not is_durable_storage(storage):
+        return False
+    return storage.fail_exchange(exchange_id, category)
 
 
 def get_thread_chain(thread_id: str, max_depth: int = 20) -> list[ThreadContext]:

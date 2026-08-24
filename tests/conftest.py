@@ -31,6 +31,9 @@ env_config.reload_env({"PAL_MCP_FORCE_ENV_OVERRIDE": "false"})
 # Set default model to a specific value for tests to avoid auto mode
 # This prevents all tests from failing due to missing model parameter
 os.environ["DEFAULT_MODEL"] = "gemini-2.5-flash"
+# Existing conversation tests intentionally exercise the compatibility memory
+# backend. Durable-store tests instantiate SQLiteConversationStorage directly.
+os.environ.setdefault("PAL_CONVERSATION_BACKEND", "memory")
 
 # Force reload of config module to pick up the env var
 import config  # noqa: E402

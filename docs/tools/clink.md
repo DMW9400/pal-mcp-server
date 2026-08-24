@@ -1,5 +1,8 @@
 # Clink Tool - CLI-to-CLI Bridge
 
+Durability, worker lifecycle, encryption and recovery are documented in
+[`docs/clink-durability.md`](../clink-durability.md).
+
 **Spawn AI subagents, connect external CLIs, orchestrate isolated contexts – all without leaving your session**
 
 The `clink` tool transforms your CLI into a multi-agent orchestrator. Launch isolated Codex instances from _within_ Codex, delegate to Gemini's 1M context, or run specialized Claude agents—all while preserving conversation continuity. Instead of context-switching or token bloat, spawn fresh subagents that handle complex tasks in isolation and return only the results you need.

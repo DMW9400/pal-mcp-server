@@ -1,5 +1,6 @@
 import asyncio
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -54,7 +55,14 @@ def codex_agent():
         name="codex",
         executable=["codex"],
         internal_args=["exec"],
-        config_args=["--json", "--dangerously-bypass-approvals-and-sandbox"],
+        config_args=[
+            "--json",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--model",
+            "gpt-5.6-sol",
+            "-c",
+            'model_reasoning_effort="high"',
+        ],
         env={},
         timeout_seconds=30,
         parser="codex_jsonl",
@@ -69,8 +77,8 @@ async def _run_agent_with_process(monkeypatch, agent, role, process):
     async def fake_create_subprocess_exec(*_args, **_kwargs):
         return process
 
-    def fake_which(executable_name):
-        return f"/usr/bin/{executable_name}"
+    def fake_which(_executable_name, path=None):
+        return sys.executable
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
     monkeypatch.setattr(shutil, "which", fake_which)
