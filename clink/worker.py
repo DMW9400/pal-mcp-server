@@ -17,6 +17,7 @@ from typing import Any
 from clink import jobs
 from clink.agents import create_agent
 from clink.policy import PartnerModelPolicyError, attest_client
+from clink.partner_boundary import PartnerBoundaryAuthority
 from clink.registry import ClinkRegistry
 from utils.conversation_memory import current_exchange_id, fail_exchange
 from utils.sqlite_conversation_storage import get_default_storage
@@ -32,6 +33,7 @@ class ClinkWorker:
         self.instance_id = jobs.INSTANCE_ID
         self.store = get_default_storage()
         self.registry = ClinkRegistry()
+        self.partner_boundary_authority = PartnerBoundaryAuthority(self.instance_id)
         self._last_capability_refresh = 0.0
         self._last_cleanup = 0.0
 
@@ -79,7 +81,7 @@ class ClinkWorker:
             jobs.mark_running(run_id)
             tool = CLinkTool()
             await tool._run_pipeline(
-                agent=create_agent(client),
+                agent=create_agent(client, partner_boundary_authority=self.partner_boundary_authority),
                 client_config=client,
                 role_config=role,
                 request=request,
@@ -138,6 +140,7 @@ class ClinkWorker:
             except (NotImplementedError, RuntimeError):  # pragma: no cover - non-POSIX fallback
                 pass
         self.store.register_process(self.instance_id, "clink_worker")
+        await self.partner_boundary_authority.start()
         try:
             self.store.interrupt_stale_claims()
             self.store.cleanup()
@@ -168,6 +171,7 @@ class ClinkWorker:
                 stopping.cancel()
                 await asyncio.gather(stopping, return_exceptions=True)
         finally:
+            await self.partner_boundary_authority.stop()
             self.store.stop_process(self.instance_id)
             for signum in installed_signals:
                 loop.remove_signal_handler(signum)

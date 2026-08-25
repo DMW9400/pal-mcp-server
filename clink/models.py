@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, PositiveInt, field_validator
 
@@ -40,6 +40,14 @@ class CLIRoleConfig(BaseModel):
         raise TypeError("role_args must be a list of strings or a single string")
 
 
+class NestedAgentPreference(BaseModel):
+    """Advisory partner-owned delegation preference; never an admission gate."""
+
+    substantive_model: str
+    substantive_effort: str
+    enforcement: Literal["none"] = "none"
+
+
 class CLIClientConfig(BaseModel):
     """Raw CLI client configuration before internal defaults are applied."""
 
@@ -59,6 +67,7 @@ class CLIClientConfig(BaseModel):
         default=None,
         description="Argv template for a per-call reasoning-effort override, e.g. ['-c', 'model_reasoning_effort=\"{effort}\"'].",
     )
+    nested_agent_preference: NestedAgentPreference | None = None
 
     @field_validator("model_arg_template", "reasoning_effort_arg_template", mode="before")
     @classmethod
@@ -108,6 +117,7 @@ class ResolvedCLIClient(BaseModel):
     output_to_file: OutputCaptureConfig | None = None
     model_arg_template: list[str] = Field(default_factory=list)
     reasoning_effort_arg_template: list[str] = Field(default_factory=list)
+    nested_agent_preference: NestedAgentPreference | None = None
 
     def supports_model_override(self) -> bool:
         return bool(self.model_arg_template)

@@ -109,7 +109,17 @@ class CLinkPollTool(SimpleTool):
         return ""
 
     async def execute(self, arguments: dict[str, Any]) -> list[TextContent]:
-        request = CLinkPollRequest(**arguments)
+        request_arguments = dict(arguments)
+        # The MCP dispatcher annotates every tool call with this internal field
+        # after public schema validation. Consume only the exact annotation for
+        # this tool; the strict request model continues to reject user extras.
+        current_tool_name = request_arguments.pop("_current_tool_name", None)
+        if current_tool_name not in (None, self.get_name()):
+            return self._error(
+                f"Internal tool annotation mismatch: expected {self.get_name()!r}, got {current_tool_name!r}",
+                run_id=None,
+            )
+        request = CLinkPollRequest(**request_arguments)
 
         try:
             run_id = jobs.validate_run_id(request.run_id)

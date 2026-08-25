@@ -186,6 +186,7 @@ class ClinkRegistry:
             working_dir=working_dir,
             model_arg_template=model_arg_template,
             reasoning_effort_arg_template=reasoning_effort_arg_template,
+            nested_agent_preference=raw.nested_agent_preference,
         )
         try:
             for role in resolved.roles.values():

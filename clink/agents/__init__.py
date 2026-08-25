@@ -16,9 +16,11 @@ _AGENTS: dict[str, type[BaseCLIAgent]] = {
 }
 
 
-def create_agent(client: ResolvedCLIClient) -> BaseCLIAgent:
+def create_agent(client: ResolvedCLIClient, *, partner_boundary_authority=None) -> BaseCLIAgent:
     agent_key = (client.runner or client.name).lower()
     agent_cls = _AGENTS.get(agent_key, BaseCLIAgent)
+    if agent_cls is ClaudeAgent:
+        return agent_cls(client, partner_boundary_authority=partner_boundary_authority)
     return agent_cls(client)
 
 

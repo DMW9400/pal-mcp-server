@@ -102,11 +102,13 @@ class ClaudeJSONParser(BaseParser):
 
         model_usage = payload.get("modelUsage")
         if isinstance(model_usage, dict) and model_usage:
-            if len(model_usage) != 1:
-                raise ParserError("Claude CLI reported multiple models in one run")
             metadata["model_usage"] = model_usage
-            first_model = next(iter(model_usage.keys()))
-            metadata["model_used"] = first_model
+            # Claude reports aggregate usage for the directly addressed agent and
+            # any agents it launches. Preserve every observed model, but do not
+            # infer the direct partner identity from this unordered aggregate.
+            # The direct model is attested independently from the immutable launch
+            # command by BaseCLIAgent._verify_effective_policy.
+            metadata["models_used"] = list(model_usage.keys())
 
         effort = payload.get("effort") or payload.get("reasoning_effort")
         if isinstance(effort, str) and effort:

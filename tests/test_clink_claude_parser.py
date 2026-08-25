@@ -24,7 +24,8 @@ def test_claude_parser_extracts_result_and_metadata():
     parsed = parser.parse(stdout=stdout, stderr="")
 
     assert parsed.content == "42"
-    assert parsed.metadata["model_used"] == "claude-sonnet-4-5-20250929"
+    assert parsed.metadata["models_used"] == ["claude-sonnet-4-5-20250929"]
+    assert "model_used" not in parsed.metadata
     assert parsed.metadata["usage"]["output_tokens"] == 5
     assert parsed.metadata["is_error"] is False
 
@@ -68,3 +69,24 @@ def test_claude_parser_handles_array_payload_with_result_event():
     assert parsed.metadata["duration_api_ms"] == 9876
     assert parsed.metadata["raw_events"] == events
     assert parsed.metadata["raw"] == events
+
+
+def test_claude_parser_preserves_direct_and_nested_model_usage():
+    parser = ClaudeJSONParser()
+    stdout = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "result": "done",
+            "modelUsage": {
+                "claude-fable-5": {"inputTokens": 10, "outputTokens": 5},
+                "claude-sonnet-4-5": {"inputTokens": 20, "outputTokens": 8},
+            },
+        }
+    )
+
+    parsed = parser.parse(stdout=stdout, stderr="")
+
+    assert parsed.metadata["models_used"] == ["claude-fable-5", "claude-sonnet-4-5"]
+    assert parsed.metadata["model_usage"]["claude-sonnet-4-5"]["outputTokens"] == 8
+    assert "model_used" not in parsed.metadata

@@ -92,6 +92,29 @@ async def test_clink_poll_rejects_path_like_run_id():
         assert "run_id" in payload["content"]
 
 
+@pytest.mark.asyncio
+async def test_clink_poll_consumes_exact_dispatcher_annotation():
+    tool = CLinkPollTool()
+    run_id = jobs.new_run_id()
+
+    result = await tool.execute({"run_id": run_id, "_current_tool_name": "clink_poll"})
+    payload = json.loads(result[0].text)
+
+    assert payload["status"] == "error"
+    assert "No clink run record found" in payload["content"]
+
+
+@pytest.mark.asyncio
+async def test_clink_poll_rejects_mismatched_dispatcher_annotation():
+    tool = CLinkPollTool()
+
+    result = await tool.execute({"run_id": jobs.new_run_id(), "_current_tool_name": "clink"})
+    payload = json.loads(result[0].text)
+
+    assert payload["status"] == "error"
+    assert "Internal tool annotation mismatch" in payload["content"]
+
+
 # ---------------------------------------------------------------------------
 # Job store
 # ---------------------------------------------------------------------------

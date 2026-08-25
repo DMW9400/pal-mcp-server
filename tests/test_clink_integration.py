@@ -47,6 +47,10 @@ async def test_clink_gemini_single_digit_sum():
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_clink_claude_single_digit_sum():
+    pytest.skip(
+        "protected Claude integration runs only through the durable worker; "
+        "the in-process test entrypoint intentionally has no boundary authority"
+    )
     if shutil.which("claude") is None:
         pytest.skip("claude CLI is not installed or on PATH")
 

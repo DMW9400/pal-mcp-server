@@ -19,8 +19,8 @@ class CodexJSONLParser(BaseParser):
         agent_messages: list[str] = []
         errors: list[str] = []
         usage: dict[str, Any] | None = None
-        observed_models: set[str] = set()
-        observed_efforts: set[str] = set()
+        observed_models: list[str] = []
+        observed_efforts: list[str] = []
 
         for line in lines:
             if not line.startswith("{"):
@@ -36,10 +36,10 @@ class CodexJSONLParser(BaseParser):
                 payload = event.get("payload") or {}
                 model = payload.get("model")
                 effort = payload.get("effort")
-                if isinstance(model, str) and model:
-                    observed_models.add(model)
-                if isinstance(effort, str) and effort:
-                    observed_efforts.add(effort)
+                if isinstance(model, str) and model and model not in observed_models:
+                    observed_models.append(model)
+                if isinstance(effort, str) and effort and effort not in observed_efforts:
+                    observed_efforts.append(effort)
             if event_type == "item.completed":
                 item = event.get("item") or {}
                 if item.get("type") == "agent_message":
@@ -67,14 +67,10 @@ class CodexJSONLParser(BaseParser):
             metadata["errors"] = errors
         if usage:
             metadata["usage"] = usage
-        if len(observed_models) == 1:
-            metadata["model_used"] = next(iter(observed_models))
-        elif len(observed_models) > 1:
-            raise ParserError("Codex CLI reported multiple models in one run")
-        if len(observed_efforts) == 1:
-            metadata["reasoning_effort_used"] = next(iter(observed_efforts))
-        elif len(observed_efforts) > 1:
-            raise ParserError("Codex CLI reported multiple reasoning efforts in one run")
+        if observed_models:
+            metadata["models_used"] = observed_models
+        if observed_efforts:
+            metadata["reasoning_efforts_used"] = observed_efforts
         if stderr and stderr.strip():
             metadata["stderr"] = stderr.strip()
 

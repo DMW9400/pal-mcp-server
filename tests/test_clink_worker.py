@@ -99,7 +99,7 @@ async def test_worker_completes_exchange_and_run_atomically(tmp_path, monkeypatc
         capability_digest=capability.config_digest,
     )
     claim = store.claim_next_run(worker.instance_id)
-    monkeypatch.setattr("clink.worker.create_agent", lambda client: _FakeAgent())
+    monkeypatch.setattr("clink.worker.create_agent", lambda client, **_kwargs: _FakeAgent())
     _FakeAgent.calls = 0
 
     await worker._execute(claim)
@@ -317,7 +317,8 @@ async def test_separate_worker_survives_producer_store_reopen_without_model_toke
             "interrupted",
         }:
             await asyncio.sleep(0.05)
-        assert store.read_run(run_id)["status"] == "completed"
+        terminal = store.read_run(run_id)
+        assert terminal["status"] == "completed", terminal.get("error")
         assert [turn["content"] for turn in store.load_thread(thread_id)["turns"]] == [
             "fixture question",
             "fixture answer",

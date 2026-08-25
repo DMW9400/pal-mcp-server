@@ -24,12 +24,28 @@ to restore the database.
   after 90 seconds and are terminalized rather than transferred or replayed.
 - Idempotency keys bind initial calls to one thread and every call to one
   exchange/run; retries return or follow that original run without launching.
-- Claude collaboration is fixed to Fable 5 (`fable`) at `xhigh`. Codex is fixed
-  to `gpt-5.6-sol` at `high`. Config, role arguments, executable identity and
-  observed CLI metadata are validated fail-closed. Protected clients must use
-  the canonical `claude`/`codex` executable, never a configured wrapper, and
-  production calls require the independently supervised worker for both
-  foreground and background execution.
+- Claude's directly addressed partner is fixed to Fable 5 (`fable`) at `xhigh`.
+  Codex's directly addressed partner is fixed to `gpt-5.6-sol` at `high`.
+  Config, role arguments, executable identity and worker capability are attested
+  before admission. Once that direct partner is admitted, the run is greenlit:
+  terminal and nested-agent model/effort telemetry is observe-only and can never
+  invalidate, cancel, retry, or block it.
+- The durable worker alone mints and activates a short-lived in-memory boundary
+  bound to the direct Claude process's already-attested resolved executable,
+  exact PID, process-start identity, command hash, random nonce, ancestry and
+  expiry. The configured command remains the canonical `claude` name; executable
+  attestation resolves its versioned target, and boundary activation requires
+  the launched process's argv[0] to equal that exact target. It never infers
+  model authority from a basename or symlink spelling. Project hooks can only query the
+  worker's private verification socket; the client derives the server PID from
+  kernel peer credentials and requires the exact launchd-registered worker for
+  this checkout before standing down for Claude-owned nested routing. Importing
+  PAL code or hosting another same-user authority cannot self-admit. PAL's
+  Opus/high preference for substantive nested work is advisory and is excluded
+  from capability digests, worker readiness, admission and result validity.
+- Protected clients must use the canonical `claude`/`codex` executable, never a
+  configured wrapper or direct-model fallback. Production calls require the
+  independently supervised worker for foreground and background execution.
 
 Idempotency keys are request-bound within this local PAL trust boundary. A key
 reused with different semantic request content is rejected; an identical retry
@@ -48,10 +64,26 @@ Install or refresh the per-user launchd service:
 scripts/clink-worker-service.sh install
 ```
 
-Inspect it with `scripts/clink-worker-service.sh status`. The worker is idle and
+Inspect it with `scripts/clink-worker-service.sh status`; status validates every
+protected role against one exact worker instance. The worker is idle and
 uses no model tokens until PAL queues a clink call. Capability heartbeats and
 polling are local SQLite operations. Background calls fail before inserting a
 turn unless a fresh matching worker capability exists.
+
+Submit long work with `background: true` and a stable request-scoped idempotency
+key. Capture `run_id` and `continuation_id`, then poll the same run. A request
+timeout renews observation by another poll; it never authorizes a duplicate
+submission. If the MCP transport closes, the launchd worker continues and the
+durable run/result remains recoverable after the desktop client opens a fresh
+transport. Never kill an MCP child or worker as a retry mechanism.
+
+If a direct launch is rejected before admission, first run `status` and
+`python -m clink.readiness`. Refresh only with `scripts/clink-worker-service.sh
+install` when readiness or worker digests are stale. If readiness is exact but
+activation still fails, compare the canonical executable's resolved target with
+the launch receipt and run `tests/test_clink_partner_boundary.py`; do not add a
+wrapper, alias, fallback model, or post-run telemetry gate. The boundary's
+resolved-version-path regression is the owner for symlinked Claude installs.
 
 ## Recovery and backup
 

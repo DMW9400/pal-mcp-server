@@ -123,8 +123,9 @@ class BaseCLIAgent:
     #: Overridable so tests can exercise the heartbeat without waiting 20 seconds.
     heartbeat_interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS
 
-    def __init__(self, client: ResolvedCLIClient):
+    def __init__(self, client: ResolvedCLIClient, *, partner_boundary_authority=None):
         self.client = client
+        self._partner_boundary_authority = partner_boundary_authority
         self._parser: BaseParser = get_parser(client.parser)
         self._logger = logging.getLogger(f"clink.runner.{client.name}")
 
@@ -144,7 +145,7 @@ class BaseCLIAgent:
         # accepted here only to keep parity with SimpleTool callers.
         _ = (files, images)
         # The runner simply executes the configured CLI command for the selected role.
-        command = self._build_command(role=role, system_prompt=system_prompt)
+        command = self._build_command(role=role, system_prompt=system_prompt, files=files)
         command = self._apply_runtime_overrides(
             command,
             model=model,
@@ -155,7 +156,7 @@ class BaseCLIAgent:
             capability = attest_client(self.client, role)
         except PartnerModelPolicyError as exc:
             raise CLIAgentError(str(exc)) from exc
-        env = self._build_environment()
+        env = self._build_environment(capability)
 
         # Resolve executable path for cross-platform compatibility (especially Windows)
         command[0] = capability.executable
@@ -200,8 +201,16 @@ class BaseCLIAgent:
                 env=env,
                 start_new_session=os.name == "posix",
             )
-        except FileNotFoundError as exc:
-            raise CLIAgentError(f"Executable not found for CLI '{self.client.name}': {exc}") from exc
+        except OSError as exc:
+            self._cleanup_launch_context()
+            raise CLIAgentError(f"Could not start executable for CLI '{self.client.name}': {exc}") from exc
+
+        try:
+            self._activate_launch_context(process)
+        except Exception as exc:
+            await self._kill_subprocess(process)
+            self._cleanup_launch_context()
+            raise CLIAgentError(f"Could not activate CLI launch boundary: {exc}") from exc
 
         try:
             stdout_text, stderr_text = await asyncio.wait_for(
@@ -210,9 +219,11 @@ class BaseCLIAgent:
             )
         except asyncio.CancelledError:
             await self._kill_subprocess(process)
+            self._cleanup_launch_context()
             raise
         except asyncio.TimeoutError as exc:
             await self._kill_subprocess(process)
+            self._cleanup_launch_context()
             raise CLIAgentError(
                 f"CLI '{self.client.name}' timed out after {self.client.timeout_seconds} seconds",
                 returncode=None,
@@ -243,9 +254,11 @@ class BaseCLIAgent:
             )
             if recovered is not None:
                 self._verify_effective_policy(recovered.parsed, capability, return_code, stdout_text, stderr_text)
+                self._cleanup_launch_context()
                 return recovered
 
         if return_code != 0:
+            self._cleanup_launch_context()
             raise CLIAgentError(
                 f"CLI '{self.client.name}' exited with status {return_code}",
                 returncode=return_code,
@@ -256,6 +269,7 @@ class BaseCLIAgent:
         try:
             parsed = self._parser.parse(stdout_text, stderr_text)
         except ParserError as exc:
+            self._cleanup_launch_context()
             raise CLIAgentError(
                 f"Failed to parse output from CLI '{self.client.name}': {exc}",
                 returncode=return_code,
@@ -264,6 +278,7 @@ class BaseCLIAgent:
             ) from exc
 
         self._verify_effective_policy(parsed, capability, return_code, stdout_text, stderr_text)
+        self._cleanup_launch_context()
 
         return AgentOutput(
             parsed=parsed,
@@ -284,13 +299,26 @@ class BaseCLIAgent:
         stdout: str,
         stderr: str,
     ) -> None:
-        """Bind missing output metadata to the already-attested exact command."""
+        """Bind direct-partner metadata to the already-attested exact command.
+
+        A CLI's aggregate usage may include agents launched by the addressed
+        partner. Those nested models are telemetry, not PAL policy subjects.
+        """
         policy = get_policy(self.client.name)
         if policy is not None:
-            observed_by_cli = "model_used" in parsed.metadata and "reasoning_effort_used" in parsed.metadata
-            parsed.metadata.setdefault("model_used", capability.model)
-            parsed.metadata.setdefault("reasoning_effort_used", capability.reasoning_effort)
-            parsed.metadata["policy_observation_source"] = "cli" if observed_by_cli else "attested_command"
+            cli_reported_model = parsed.metadata.pop("model_used", None)
+            if cli_reported_model is not None:
+                parsed.metadata.setdefault("models_used", [cli_reported_model])
+            cli_reported_effort = parsed.metadata.pop("reasoning_effort_used", None)
+            if cli_reported_effort is not None:
+                parsed.metadata.setdefault("reasoning_efforts_used", [cli_reported_effort])
+            parsed.metadata["model_used"] = capability.model
+            parsed.metadata["reasoning_effort_used"] = capability.reasoning_effort
+            parsed.metadata["policy_observation_source"] = "attested_command"
+            parsed.metadata["post_admission_model_policy"] = "observe_only"
+            if self.client.nested_agent_preference is not None:
+                parsed.metadata["nested_agent_preference"] = self.client.nested_agent_preference.model_dump()
+            return
         try:
             verify_observed_policy(self.client.name, parsed.metadata)
         except PartnerModelPolicyError as exc:
@@ -475,7 +503,14 @@ class BaseCLIAgent:
         result.extend(overrides)
         return result
 
-    def _build_command(self, *, role: ResolvedCLIRole, system_prompt: str | None) -> list[str]:
+    def _build_command(
+        self,
+        *,
+        role: ResolvedCLIRole,
+        system_prompt: str | None,
+        files: Sequence[str] = (),
+    ) -> list[str]:
+        _ = files
         base = list(self.client.executable)
         base.extend(self.client.internal_args)
         base.extend(self.client.config_args)
@@ -483,10 +518,17 @@ class BaseCLIAgent:
 
         return base
 
-    def _build_environment(self) -> dict[str, str]:
+    def _build_environment(self, capability=None) -> dict[str, str]:
+        _ = capability
         env = os.environ.copy()
         env.update(self.client.env)
         return env
+
+    def _activate_launch_context(self, process) -> None:
+        _ = process
+
+    def _cleanup_launch_context(self) -> None:
+        return None
 
     # ------------------------------------------------------------------
     # Error recovery hooks

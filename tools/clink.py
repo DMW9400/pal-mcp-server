@@ -185,9 +185,23 @@ class CLinkTool(SimpleTool):
                         arguments["_worker_instance_id"] = worker["owner_instance_id"]
                         return arguments
                     if get_policy(client.name) and os.environ.get("PAL_CLINK_ALLOW_UNSUPERVISED") != "1":
+                        mismatch = []
+                        if worker is None:
+                            mismatch.append("no fresh worker capability receipt")
+                        else:
+                            for label, expected, observed in (
+                                ("config_digest", capability.config_digest, worker.get("config_digest")),
+                                ("executable_identity", capability.executable_identity, worker.get("executable_identity")),
+                                ("model", capability.model, worker.get("model")),
+                                ("reasoning_effort", capability.reasoning_effort, worker.get("reasoning_effort")),
+                            ):
+                                if expected != observed:
+                                    mismatch.append(f"{label} expected={expected!r} worker={observed!r}")
                         self._raise_tool_error(
                             "Protected Claude/Codex clink execution requires the independently supervised "
-                            "worker; no turn or model cost was consumed"
+                            f"worker for role '{role.name}': {'; '.join(mismatch)}. Refresh with "
+                            "scripts/clink-worker-service.sh install, then run python -m clink.readiness. "
+                            "No turn or model cost was consumed"
                         )
                     storage.publish_capability(
                         cli_name=capability.cli_name,

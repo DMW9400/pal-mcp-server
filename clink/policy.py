@@ -45,7 +45,6 @@ POLICIES: dict[str, PartnerModelPolicy] = {
     ),
 }
 
-
 @dataclass(frozen=True)
 class ClientCapability:
     cli_name: str
@@ -101,6 +100,10 @@ def validate_command_policy(cli_name: str, argv: Sequence[str]) -> None:
     effort_positions = [index for index, value in enumerate(argv) if value in forbidden_effort_flags]
     inline_model_flags = [value for value in argv if value.startswith(("--model=", "-m="))]
     inline_effort_flags = [value for value in argv if value.startswith("--effort=")]
+    if cli_name.lower() == "claude" and any(
+        value == "--fallback-model" or value.startswith("--fallback-model=") for value in argv
+    ):
+        raise PartnerModelPolicyError("CLI 'claude' command contains a direct-model fallback")
     if len(model_positions) != 1 or inline_model_flags:
         raise PartnerModelPolicyError(f"CLI '{cli_name}' command contains a conflicting model flag")
     if cli_name.lower() == "claude" and (len(effort_positions) != 1 or inline_effort_flags):
@@ -180,15 +183,13 @@ def attest_client(client, role=None, *, path: str | None = None) -> ClientCapabi
 
 
 def verify_observed_policy(cli_name: str, metadata: dict) -> None:
-    """Reject a positive observed mismatch; command attestation remains mandatory."""
+    """Retained compatibility hook; protected partners are attested pre-admission.
+
+    Terminal CLI metadata can aggregate child agents. Once an exact protected
+    launch is admitted it is greenlit, so no post-run model or effort value may
+    invalidate it.
+    """
     policy = get_policy(cli_name)
     if policy is None:
         return
-    observed_model = metadata.get("model_used")
-    if observed_model is not None and str(observed_model) not in policy.observed_model_aliases:
-        raise PartnerModelPolicyError(f"CLI '{cli_name}' reported forbidden model '{observed_model}' after execution")
-    observed_effort = metadata.get("reasoning_effort_used")
-    if observed_effort is not None and str(observed_effort) != policy.reasoning_effort:
-        raise PartnerModelPolicyError(
-            f"CLI '{cli_name}' reported forbidden reasoning effort '{observed_effort}' after execution"
-        )
+    _ = metadata

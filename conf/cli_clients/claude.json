@@ -10,6 +10,11 @@
     "xhigh"
   ],
   "env": {},
+  "nested_agent_preference": {
+    "substantive_model": "opus",
+    "substantive_effort": "high",
+    "enforcement": "none"
+  },
   "roles": {
     "default": {
       "prompt_path": "systemprompts/clink/default.txt",
