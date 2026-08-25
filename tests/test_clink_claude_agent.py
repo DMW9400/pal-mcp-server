@@ -117,6 +117,9 @@ async def test_claude_agent_injects_system_prompt(monkeypatch, claude_agent):
     idx = result.sanitized_command.index("--append-system-prompt")
     assert result.sanitized_command[idx + 1] == "System prompt"
     assert process.stdin_data.decode().startswith("Respond with 42")
+    assert result.parsed.metadata["model_used"] == "fable"
+    assert result.parsed.metadata["reasoning_effort_used"] == "xhigh"
+    assert result.parsed.metadata["policy_observation_source"] == "attested_command"
 
 
 @pytest.mark.asyncio

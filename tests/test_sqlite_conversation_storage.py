@@ -7,6 +7,7 @@ from utils.sqlite_conversation_storage import (
     ConversationBusy,
     ConversationCapacityError,
     ExecutionReadinessError,
+    IdempotencyConflict,
     SQLiteConversationStorage,
     StorageCorruptionError,
     StorageKeyError,
@@ -20,6 +21,20 @@ def store(tmp_path):
 
 def _turn(role, content):
     return {"role": role, "content": content, "timestamp": "2026-08-24T00:00:00+00:00"}
+
+
+def _ready_worker(store, instance_id="worker-1", digest="test-digest"):
+    store.register_process(instance_id, "clink_worker")
+    store.publish_capability(
+        cli_name="codex",
+        role="default",
+        config_digest=digest,
+        executable_identity="test-executable",
+        model="gpt-5.6-sol",
+        reasoning_effort="high",
+        owner_instance_id=instance_id,
+        owner_mode="clink_worker",
+    )
 
 
 def test_restart_reopens_encrypted_thread_without_plaintext(tmp_path):
@@ -59,10 +74,50 @@ def test_idempotent_admission_does_not_duplicate(store):
     assert count == 1
 
 
+def test_idempotent_admission_ignores_turn_timestamp_but_rejects_changed_request(store):
+    thread_id = store.create_thread("clink", {})
+    first = store.begin_exchange(
+        thread_id,
+        "clink",
+        {**_turn("user", "one"), "timestamp": "2026-08-24T00:00:00+00:00"},
+        "stable-request-2",
+    )
+    replay = store.begin_exchange(
+        thread_id,
+        "clink",
+        {**_turn("user", "one"), "timestamp": "2026-08-24T00:01:00+00:00"},
+        "stable-request-2",
+    )
+    assert replay.exchange_id == first.exchange_id
+    with pytest.raises(IdempotencyConflict):
+        store.begin_exchange(thread_id, "clink", _turn("user", "changed"), "stable-request-2")
+
+
+def test_idempotent_admission_is_bound_to_execution_request(store):
+    thread_id = store.create_thread("clink", {})
+    store.begin_exchange(
+        thread_id,
+        "clink",
+        _turn("user", "one"),
+        "stable-request-3",
+        idempotency_context={"cli_name": "codex", "role": "default"},
+    )
+    with pytest.raises(IdempotencyConflict):
+        store.begin_exchange(
+            thread_id,
+            "clink",
+            _turn("user", "one"),
+            "stable-request-3",
+            idempotency_context={"cli_name": "claude", "role": "default"},
+        )
+
+
 def test_initial_idempotency_reuses_thread_and_original_run(store):
     first_thread = store.create_thread("clink", {"prompt": "one"}, initial_idempotency_key="initial-key")
-    second_thread = store.create_thread("clink", {"prompt": "two"}, initial_idempotency_key="initial-key")
+    second_thread = store.create_thread("clink", {"prompt": "one"}, initial_idempotency_key="initial-key")
     assert second_thread == first_thread
+    with pytest.raises(IdempotencyConflict):
+        store.create_thread("clink", {"prompt": "two"}, initial_idempotency_key="initial-key")
 
     admission = store.begin_exchange(first_thread, "clink", _turn("user", "one"), "initial-key")
     run_id = str(uuid.uuid4())
@@ -77,6 +132,20 @@ def test_initial_idempotency_reuses_thread_and_original_run(store):
     replay = store.begin_exchange(first_thread, "clink", _turn("user", "one"), "initial-key")
     assert replay.idempotent is True
     assert replay.run_id == run_id
+
+
+def test_initial_idempotency_ignores_wait_mode(store):
+    first = store.create_thread(
+        "clink",
+        {"prompt": "one", "background": True, "idempotency_key": "initial-wait-key"},
+        initial_idempotency_key="initial-wait-key",
+    )
+    replay = store.create_thread(
+        "clink",
+        {"prompt": "one", "background": False, "idempotency_key": "initial-wait-key"},
+        initial_idempotency_key="initial-wait-key",
+    )
+    assert replay == first
 
 
 def test_capacity_reserves_complete_pair(store):
@@ -211,6 +280,7 @@ def test_cleanup_removes_only_expired_inactive_state(store):
 
 
 def test_queue_claim_heartbeat_extends_only_owners_lease(store):
+    _ready_worker(store)
     run_id = str(uuid.uuid4())
     store.create_queued_worker_run(
         run_id=run_id,
@@ -218,7 +288,14 @@ def test_queue_claim_heartbeat_extends_only_owners_lease(store):
         exchange_id=None,
         cli_name="codex",
         role="default",
-        envelope={"secret": "prepared"},
+        envelope={
+            "secret": "prepared",
+            "cli_name": "codex",
+            "role": "default",
+            "capability_digest": "test-digest",
+        },
+        assigned_worker_instance_id="worker-1",
+        capability_digest="test-digest",
     )
     store.claim_next_run("worker-1", lease_seconds=1)
     before = (
@@ -262,7 +339,48 @@ def test_run_heartbeat_extends_its_active_exchange(store):
     assert after > before
 
 
+def test_stale_pal_run_is_interrupted_and_releases_thread(store):
+    thread_id = store.create_thread("clink", {})
+    admission = store.begin_exchange(thread_id, "clink", _turn("user", "one"), "pal-stale-key")
+    run_id = str(uuid.uuid4())
+    store.create_run(
+        run_id=run_id,
+        continuation_id=thread_id,
+        exchange_id=admission.exchange_id,
+        cli_name="codex",
+        role="default",
+        owner_instance_id="dead-pal",
+    )
+    with store._write() as connection:
+        connection.execute("UPDATE clink_runs SET lease_expires_at_us=0 WHERE run_id=?", (run_id,))
+    assert store.interrupt_stale_pal_runs() == 1
+    assert store.read_run(run_id)["status"] == "interrupted"
+    assert (
+        store.connection()
+        .execute("SELECT active_exchange_id FROM conversation_threads WHERE thread_id=?", (thread_id,))
+        .fetchone()[0]
+        is None
+    )
+    following = store.begin_exchange(thread_id, "clink", _turn("user", "two"), "pal-following-key")
+    assert following.exchange_id != admission.exchange_id
+
+
+def test_idempotent_admission_gap_reuses_exchange_without_duplicate_turn(store):
+    thread_id = store.create_thread("clink", {})
+    first = store.begin_exchange(thread_id, "clink", _turn("user", "one"), "admission-gap-key")
+    with store._write() as connection:
+        connection.execute(
+            "UPDATE conversation_exchanges SET lease_expires_at_us=0 WHERE exchange_id=?", (first.exchange_id,)
+        )
+    recovered = store.begin_exchange(thread_id, "clink", _turn("user", "one"), "admission-gap-key")
+    assert recovered.exchange_id == first.exchange_id
+    assert recovered.idempotent is False
+    assert recovered.pre_user_thread["turns"] == []
+    assert store.connection().execute("SELECT COUNT(*) FROM conversation_turns").fetchone()[0] == 1
+
+
 def test_expired_unclaimed_queue_is_interrupted_and_never_claimed(store):
+    _ready_worker(store, "late-worker")
     run_id = str(uuid.uuid4())
     store.create_queued_worker_run(
         run_id=run_id,
@@ -270,7 +388,14 @@ def test_expired_unclaimed_queue_is_interrupted_and_never_claimed(store):
         exchange_id=None,
         cli_name="codex",
         role="default",
-        envelope={"secret": "do not execute late"},
+        envelope={
+            "secret": "do not execute late",
+            "cli_name": "codex",
+            "role": "default",
+            "capability_digest": "test-digest",
+        },
+        assigned_worker_instance_id="late-worker",
+        capability_digest="test-digest",
     )
     with store._write() as connection:
         connection.execute("UPDATE clink_run_queue SET lease_expires_at_us=0 WHERE run_id=?", (run_id,))
@@ -279,6 +404,40 @@ def test_expired_unclaimed_queue_is_interrupted_and_never_claimed(store):
     record = store.read_run(run_id)
     assert record["status"] == "interrupted"
     assert record["error"]["category"] == "worker_queue_expired"
+
+
+def test_worker_assignment_is_exclusive_and_healthy_backlog_lease_extends(store):
+    _ready_worker(store)
+    run_id = str(uuid.uuid4())
+    store.create_queued_worker_run(
+        run_id=run_id,
+        continuation_id=None,
+        exchange_id=None,
+        cli_name="codex",
+        role="default",
+        envelope={
+            "request": "one",
+            "cli_name": "codex",
+            "role": "default",
+            "capability_digest": "test-digest",
+        },
+        assigned_worker_instance_id="worker-1",
+        capability_digest="test-digest",
+    )
+    assert store.claim_next_run("worker-2") is None
+    before = (
+        store.connection()
+        .execute("SELECT lease_expires_at_us FROM clink_run_queue WHERE run_id=?", (run_id,))
+        .fetchone()[0]
+    )
+    assert store.heartbeat_queued_runs("worker-1", lease_seconds=300) == 1
+    after = (
+        store.connection()
+        .execute("SELECT lease_expires_at_us FROM clink_run_queue WHERE run_id=?", (run_id,))
+        .fetchone()[0]
+    )
+    assert after > before
+    assert store.claim_next_run("worker-1")["run_id"] == run_id
 
 
 def test_schema_hash_tampering_fails(store):
@@ -292,6 +451,10 @@ def test_valid_v1_database_migrates_to_current(store):
     connection = store.connection()
     connection.execute("DELETE FROM schema_migrations WHERE version>=2")
     connection.execute("DROP INDEX one_initial_idempotency_key_per_tool")
+    connection.execute("ALTER TABLE clink_run_queue DROP COLUMN capability_digest")
+    connection.execute("ALTER TABLE clink_run_queue DROP COLUMN assigned_worker_instance_id")
+    connection.execute("ALTER TABLE conversation_exchanges DROP COLUMN request_hash")
+    connection.execute("ALTER TABLE conversation_threads DROP COLUMN initial_request_hash")
     connection.execute("ALTER TABLE conversation_threads DROP COLUMN initial_idempotency_hash")
     connection.execute("ALTER TABLE worker_capabilities DROP COLUMN owner_mode")
     connection.close()
@@ -299,7 +462,7 @@ def test_valid_v1_database_migrates_to_current(store):
     reopened = SQLiteConversationStorage(store.state_dir, store.key_file)
     versions = reopened.connection().execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
     columns = reopened.connection().execute("PRAGMA table_info(worker_capabilities)").fetchall()
-    assert [row[0] for row in versions] == [1, 2, 3]
+    assert [row[0] for row in versions] == [1, 2, 3, 4]
     assert "owner_mode" in {row[1] for row in columns}
 
 

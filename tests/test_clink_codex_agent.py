@@ -98,6 +98,9 @@ async def test_codex_agent_recovers_jsonl(monkeypatch, codex_agent):
     assert result.returncode == 124
     assert "Hello from Codex" in result.parsed.content
     assert result.parsed.metadata["usage"]["output_tokens"] == 5
+    assert result.parsed.metadata["model_used"] == "gpt-5.6-sol"
+    assert result.parsed.metadata["reasoning_effort_used"] == "high"
+    assert result.parsed.metadata["policy_observation_source"] == "attested_command"
 
 
 @pytest.mark.asyncio

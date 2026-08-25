@@ -14,6 +14,7 @@ from clink.parsers.base import ParsedCLIResponse
 from clink.policy import attest_client
 from clink.worker import ClinkWorker
 from tools.clink import CLinkRequest, CLinkTool
+from tools.shared.exceptions import ToolExecutionError
 from utils.sqlite_conversation_storage import get_default_storage, reset_default_storage_for_tests
 
 
@@ -94,6 +95,8 @@ async def test_worker_completes_exchange_and_run_atomically(tmp_path, monkeypatc
         cli_name="codex",
         role="default",
         envelope=envelope,
+        assigned_worker_instance_id=worker.instance_id,
+        capability_digest=capability.config_digest,
     )
     claim = store.claim_next_run(worker.instance_id)
     monkeypatch.setattr("clink.worker.create_agent", lambda client: _FakeAgent())
@@ -120,6 +123,17 @@ async def test_worker_completes_exchange_and_run_atomically(tmp_path, monkeypatc
 
 def test_expired_claim_is_interrupted_not_reexecuted(tmp_path, monkeypatch):
     store = _configure(tmp_path, monkeypatch)
+    store.register_process("dead-worker", "clink_worker")
+    store.publish_capability(
+        cli_name="codex",
+        role="default",
+        config_digest="test-digest",
+        executable_identity="test-executable",
+        model="gpt-5.6-sol",
+        reasoning_effort="high",
+        owner_instance_id="dead-worker",
+        owner_mode="clink_worker",
+    )
     run_id = str(uuid.uuid4())
     store.create_queued_worker_run(
         run_id=run_id,
@@ -127,7 +141,14 @@ def test_expired_claim_is_interrupted_not_reexecuted(tmp_path, monkeypatch):
         exchange_id=None,
         cli_name="codex",
         role="default",
-        envelope={"secret": "never replay"},
+        envelope={
+            "secret": "never replay",
+            "cli_name": "codex",
+            "role": "default",
+            "capability_digest": "test-digest",
+        },
+        assigned_worker_instance_id="dead-worker",
+        capability_digest="test-digest",
     )
     assert store.claim_next_run("dead-worker", lease_seconds=1)["run_id"] == run_id
     with store._write() as connection:
@@ -161,6 +182,15 @@ async def test_preflight_selects_only_exact_fresh_worker_capability(tmp_path, mo
     )
     assert arguments["_execution_owner"] == "worker"
     assert arguments["_capability_digest"] == capability.config_digest
+
+
+@pytest.mark.asyncio
+async def test_protected_preflight_requires_supervised_worker(tmp_path, monkeypatch):
+    _configure(tmp_path, monkeypatch)
+    monkeypatch.delenv("PAL_CLINK_ALLOW_UNSUPERVISED", raising=False)
+    tool = CLinkTool()
+    with pytest.raises(ToolExecutionError, match="independently supervised worker"):
+        await tool.preflight_continuation({"prompt": "must not launch locally", "cli_name": "codex", "role": "default"})
 
 
 def test_new_durable_thread_failure_propagates_before_execution(tmp_path, monkeypatch):
@@ -271,6 +301,8 @@ async def test_separate_worker_survives_producer_store_reopen_without_model_toke
                 "absolute_file_paths": [],
                 "images": [],
             },
+            assigned_worker_instance_id=capability["owner_instance_id"],
+            capability_digest=capability["config_digest"],
         )
 
         # Dropping and reopening the producer's store simulates the PAL-side

@@ -160,6 +160,10 @@ class CLinkTool(SimpleTool):
         except PartnerModelPolicyError as exc:
             self._raise_tool_error(f"Clink execution owner is not ready: {exc}")
         if capability:
+            arguments["_effective_cli_name"] = capability.cli_name
+            arguments["_effective_role"] = role.name
+            arguments["_effective_model"] = capability.model or request.model
+            arguments["_effective_reasoning_effort"] = capability.reasoning_effort or request.reasoning_effort
             try:
                 from utils.conversation_memory import get_storage
 
@@ -178,7 +182,13 @@ class CLinkTool(SimpleTool):
                     if worker_matches:
                         arguments["_execution_owner"] = "worker"
                         arguments["_capability_digest"] = capability.config_digest
+                        arguments["_worker_instance_id"] = worker["owner_instance_id"]
                         return arguments
+                    if get_policy(client.name) and os.environ.get("PAL_CLINK_ALLOW_UNSUPERVISED") != "1":
+                        self._raise_tool_error(
+                            "Protected Claude/Codex clink execution requires the independently supervised "
+                            "worker; no turn or model cost was consumed"
+                        )
                     storage.publish_capability(
                         cli_name=capability.cli_name,
                         role=role.name,
@@ -297,6 +307,7 @@ class CLinkTool(SimpleTool):
         self._current_arguments = arguments
         execution_owner = arguments.get("_execution_owner", "pal")
         admitted_capability_digest = arguments.get("_capability_digest")
+        admitted_worker_instance_id = arguments.get("_worker_instance_id")
         request = self.get_request_model()(**arguments)
 
         if arguments.get("_idempotent_replay"):
@@ -404,6 +415,8 @@ class CLinkTool(SimpleTool):
                     cli_name=client_config.name,
                     role=role_config.name,
                     envelope=envelope,
+                    assigned_worker_instance_id=admitted_worker_instance_id,
+                    capability_digest=capability.config_digest,
                 )
             except Exception as exc:
                 logger.warning("Failed to enqueue clink worker run %s", run_id, exc_info=True)
@@ -983,6 +996,7 @@ class CLinkTool(SimpleTool):
                     images=self.get_request_images(request),
                     idempotency_key=request.idempotency_key,
                     capability_digest=capability_digest,
+                    idempotency_context=self._idempotency_execution_context(request),
                 )
                 self._current_arguments["_exchange_id"] = admission["exchange_id"]
                 if admission.get("idempotent"):
@@ -1005,6 +1019,16 @@ class CLinkTool(SimpleTool):
             if durable:
                 raise
             return None
+
+    def _idempotency_execution_context(self, request: CLinkRequest) -> dict[str, Any]:
+        cli_name = request.cli_name or self._default_cli_name
+        policy = get_policy(cli_name) if cli_name else None
+        return {
+            "cli_name": cli_name,
+            "role": request.role or "default",
+            "model": policy.model if policy else request.model,
+            "reasoning_effort": policy.reasoning_effort if policy else request.reasoning_effort,
+        }
 
     def _continuation_offer_for_thread(self, thread_id: str | None) -> dict[str, Any] | None:
         """Build a continuation offer from the already-existing thread."""

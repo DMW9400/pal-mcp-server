@@ -20,6 +20,7 @@ from clink.parsers import BaseParser, ParsedCLIResponse, ParserError, get_parser
 from clink.policy import (
     PartnerModelPolicyError,
     attest_client,
+    get_policy,
     validate_command_policy,
     validate_request_policy,
     verify_observed_policy,
@@ -241,6 +242,7 @@ class BaseCLIAgent:
                 output_file_content=output_file_content,
             )
             if recovered is not None:
+                self._verify_effective_policy(recovered.parsed, capability, return_code, stdout_text, stderr_text)
                 return recovered
 
         if return_code != 0:
@@ -261,15 +263,7 @@ class BaseCLIAgent:
                 stderr=stderr_text,
             ) from exc
 
-        try:
-            verify_observed_policy(self.client.name, parsed.metadata)
-        except PartnerModelPolicyError as exc:
-            raise CLIAgentError(
-                str(exc),
-                returncode=return_code,
-                stdout=stdout_text,
-                stderr=stderr_text,
-            ) from exc
+        self._verify_effective_policy(parsed, capability, return_code, stdout_text, stderr_text)
 
         return AgentOutput(
             parsed=parsed,
@@ -281,6 +275,31 @@ class BaseCLIAgent:
             parser_name=self._parser.name,
             output_file_content=output_file_content,
         )
+
+    def _verify_effective_policy(
+        self,
+        parsed: ParsedCLIResponse,
+        capability,
+        return_code: int,
+        stdout: str,
+        stderr: str,
+    ) -> None:
+        """Bind missing output metadata to the already-attested exact command."""
+        policy = get_policy(self.client.name)
+        if policy is not None:
+            observed_by_cli = "model_used" in parsed.metadata and "reasoning_effort_used" in parsed.metadata
+            parsed.metadata.setdefault("model_used", capability.model)
+            parsed.metadata.setdefault("reasoning_effort_used", capability.reasoning_effort)
+            parsed.metadata["policy_observation_source"] = "cli" if observed_by_cli else "attested_command"
+        try:
+            verify_observed_policy(self.client.name, parsed.metadata)
+        except PartnerModelPolicyError as exc:
+            raise CLIAgentError(
+                str(exc),
+                returncode=return_code,
+                stdout=stdout,
+                stderr=stderr,
+            ) from exc
 
     async def _kill_subprocess(self, process) -> None:
         """Kill the CLI process group and reap it before propagating cancellation."""

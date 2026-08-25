@@ -34,6 +34,10 @@ os.environ["DEFAULT_MODEL"] = "gemini-2.5-flash"
 # Existing conversation tests intentionally exercise the compatibility memory
 # backend. Durable-store tests instantiate SQLiteConversationStorage directly.
 os.environ.setdefault("PAL_CONVERSATION_BACKEND", "memory")
+# Unit tests exercise the legacy in-process execution path with fake agents.
+# Production intentionally omits this escape and requires the supervised worker
+# for the protected Claude/Codex clients.
+os.environ.setdefault("PAL_CLINK_ALLOW_UNSUPERVISED", "1")
 
 # Force reload of config module to pick up the env var
 import config  # noqa: E402

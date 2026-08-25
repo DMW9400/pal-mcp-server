@@ -19,14 +19,22 @@ to restore the database.
   restart does not terminate active clink work.
 - A claimed call is never automatically executed again. Worker loss marks it
   interrupted after its lease expires; retry requires an explicit caller action.
-- Unclaimed queue entries also expire after 90 seconds and are terminalized,
-  so work cannot execute unexpectedly after a delayed worker restart.
+- Queue entries are assigned to one exact worker instance. A healthy worker
+  renews its backlog leases; entries left behind by a stopped worker expire
+  after 90 seconds and are terminalized rather than transferred or replayed.
 - Idempotency keys bind initial calls to one thread and every call to one
   exchange/run; retries return or follow that original run without launching.
 - Claude collaboration is fixed to Fable 5 (`fable`) at `xhigh`. Codex is fixed
   to `gpt-5.6-sol` at `high`. Config, role arguments, executable identity and
   observed CLI metadata are validated fail-closed. Protected clients must use
-  the canonical `claude`/`codex` executable, never a configured wrapper.
+  the canonical `claude`/`codex` executable, never a configured wrapper, and
+  production calls require the independently supervised worker for both
+  foreground and background execution.
+
+Idempotency keys are request-bound within this local PAL trust boundary. A key
+reused with different semantic request content is rejected; an identical retry
+returns the original thread/exchange/run. Callers should still namespace keys
+when multiple unrelated local clients share one PAL state directory.
 
 SQLite protects PAL state, not arbitrary effects performed by an external CLI.
 The contract is exactly-once state admission/terminalization, not exactly-once

@@ -1,19 +1,10 @@
-"""Durable sidecar records for clink runs.
+"""Durable records and lifecycle helpers for clink runs.
 
-Each clink invocation writes one JSON record under ``logs/clink_results/`` so a run
-whose MCP request was cancelled (or that was started with ``background=true``) can be
-retrieved later with the ``clink_poll`` tool. Records hold the ToolOutput the
-synchronous caller received with its diagnostic streams redacted (raw stdout, stderr
-and output-file blobs are replaced by a placeholder); prompts, cwd and env are never
-stored. ``output_sha256`` is computed over the stored, redacted payload so it always
-describes exactly what a poll replays.
-
-Once a record reaches a terminal status it is immutable: every mutator, including
-attachment changes, is a no-op, so a late cancellation cannot rewrite a finished run.
-
-Completed records survive a PAL restart; running work does not (the CLI child dies
-with its parent), which is why a stale non-terminal record is reported as
-``interrupted`` by readers.
+Production runs live in encrypted SQLite and protected Claude/Codex calls execute in
+the independently supervised worker, so both active work and terminal results survive
+PAL client/process detach. Terminal writes are immutable and a stale owner is marked
+interrupted rather than replayed automatically. Legacy JSON sidecars remain a
+read-only compatibility path when the explicit memory backend is selected in tests.
 """
 
 from __future__ import annotations
@@ -224,6 +215,7 @@ def create(
     if store is not None:
         from utils.conversation_memory import current_exchange_id
 
+        store.register_process(INSTANCE_ID, "pal")
         return store.create_run(
             run_id=run_id,
             continuation_id=continuation_id,
@@ -292,6 +284,7 @@ def touch(run_id: str) -> dict[str, Any] | None:
 
     store = _sqlite_store()
     if store is not None:
+        store.heartbeat_process(INSTANCE_ID)
         return store.heartbeat_run(validate_run_id(run_id))
 
     def mutate(record: dict[str, Any]) -> dict[str, Any] | None:
@@ -413,9 +406,11 @@ def sweep() -> int:
 
 
 def interrupt_stale_worker_queue() -> int:
-    """Persistently terminalize expired SQLite worker queue entries."""
+    """Terminalize expired worker queue entries and stale PAL-owned runs."""
     store = _sqlite_store()
-    return store.interrupt_stale_claims() if store is not None else 0
+    if store is None:
+        return 0
+    return store.interrupt_stale_claims() + store.interrupt_stale_pal_runs()
 
 
 def _maybe_sweep() -> None:

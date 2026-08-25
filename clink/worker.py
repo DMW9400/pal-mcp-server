@@ -124,6 +124,7 @@ class ClinkWorker:
                     owner_task.cancel()
                 return
             self.store.heartbeat_process(self.instance_id)
+            self.store.heartbeat_queued_runs(self.instance_id)
             self._publish_capabilities()
 
     async def serve(self) -> None:
@@ -145,6 +146,7 @@ class ClinkWorker:
             while not stop_requested.is_set():
                 if time.monotonic() - self._last_capability_refresh >= CAPABILITY_REFRESH_SECONDS:
                     self.store.heartbeat_process(self.instance_id)
+                    self.store.heartbeat_queued_runs(self.instance_id)
                     self.store.interrupt_stale_claims()
                     self._publish_capabilities()
                 if time.monotonic() - self._last_cleanup >= CLEANUP_INTERVAL_SECONDS:

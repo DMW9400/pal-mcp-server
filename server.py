@@ -1133,6 +1133,12 @@ async def reconstruct_thread_context(arguments: dict[str, Any]) -> dict[str, Any
             images=arguments.get("images") or [],
             idempotency_key=arguments.get("idempotency_key"),
             capability_digest=arguments.get("_capability_digest"),
+            idempotency_context={
+                "cli_name": arguments.get("_effective_cli_name", arguments.get("cli_name")),
+                "role": arguments.get("_effective_role", arguments.get("role") or "default"),
+                "model": arguments.get("_effective_model", arguments.get("model")),
+                "reasoning_effort": arguments.get("_effective_reasoning_effort", arguments.get("reasoning_effort")),
+            },
         )
         context = admission["pre_user_thread"]
         arguments["_exchange_id"] = admission["exchange_id"]

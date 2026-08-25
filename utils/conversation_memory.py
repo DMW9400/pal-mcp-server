@@ -440,6 +440,7 @@ def begin_exchange(
     idempotency_key: str | None = None,
     capability_digest: str | None = None,
     owner_instance_id: str | None = None,
+    idempotency_context: dict[str, Any] | None = None,
 ):
     """Atomically claim a thread and insert one user turn with assistant capacity reserved."""
     storage = get_storage()
@@ -463,6 +464,7 @@ def begin_exchange(
         client_idempotency_key=idempotency_key,
         owner_instance_id=owner_instance_id,
         capability_digest=capability_digest,
+        idempotency_context=idempotency_context,
         ttl_seconds=CONVERSATION_TIMEOUT_SECONDS,
         max_turns=MAX_CONVERSATION_TURNS,
     )

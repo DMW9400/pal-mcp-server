@@ -28,7 +28,7 @@ from typing import Any
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "interrupted"})
 ACTIVE_EXCHANGE_STATUSES = frozenset({"admitted", "running"})
 
@@ -69,6 +69,10 @@ class ConversationCapacityError(DurableStorageError):
 
 
 class ExecutionReadinessError(DurableStorageError):
+    pass
+
+
+class IdempotencyConflict(DurableStorageError):
     pass
 
 
@@ -123,6 +127,9 @@ class _Codec:
 
     def keyed_hash(self, value: str) -> str:
         return hmac.new(self._key, value.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def keyed_json_hash(self, value: Any) -> str:
+        return hmac.new(self._key, _json_bytes(value), hashlib.sha256).hexdigest()
 
 
 def _fsync_directory(path: Path) -> None:
@@ -311,7 +318,23 @@ CREATE UNIQUE INDEX one_initial_idempotency_key_per_tool
   WHERE initial_idempotency_hash IS NOT NULL;
 """
 _MIGRATION_3_HASH = hashlib.sha256(_MIGRATION_3.encode("utf-8")).hexdigest()
-_MIGRATION_HASHES = {1: _SCHEMA_HASH, 2: _MIGRATION_2_HASH, 3: _MIGRATION_3_HASH}
+_MIGRATION_4 = """
+ALTER TABLE conversation_threads
+  ADD COLUMN initial_request_hash TEXT;
+ALTER TABLE conversation_exchanges
+  ADD COLUMN request_hash TEXT;
+ALTER TABLE clink_run_queue
+  ADD COLUMN assigned_worker_instance_id TEXT;
+ALTER TABLE clink_run_queue
+  ADD COLUMN capability_digest TEXT;
+"""
+_MIGRATION_4_HASH = hashlib.sha256(_MIGRATION_4.encode("utf-8")).hexdigest()
+_MIGRATION_HASHES = {
+    1: _SCHEMA_HASH,
+    2: _MIGRATION_2_HASH,
+    3: _MIGRATION_3_HASH,
+    4: _MIGRATION_4_HASH,
+}
 
 
 class SQLiteConversationStorage:
@@ -429,6 +452,16 @@ class SQLiteConversationStorage:
                     "INSERT INTO schema_migrations(version,migration_sha256,applied_at_us) VALUES(?,?,?)",
                     (3, _MIGRATION_3_HASH, _now_us()),
                 )
+            current_version = 3
+        if current_version < 4:
+            with self._write() as transaction:
+                for statement in _MIGRATION_4.split(";"):
+                    if statement.strip():
+                        transaction.execute(statement)
+                transaction.execute(
+                    "INSERT INTO schema_migrations(version,migration_sha256,applied_at_us) VALUES(?,?,?)",
+                    (4, _MIGRATION_4_HASH, _now_us()),
+                )
         check = connection.execute("PRAGMA quick_check").fetchone()[0]
         if check != "ok":
             raise StorageCorruptionError("PAL state database quick_check failed")
@@ -476,14 +509,22 @@ class SQLiteConversationStorage:
         thread_id = _canonical_uuid(thread_id or str(uuid.uuid4()), "thread_id")
         now = _now_us()
         initial_idempotency_hash = self._codec.keyed_hash(initial_idempotency_key) if initial_idempotency_key else None
+        semantic_initial_context = {
+            key: value for key, value in initial_context.items() if key not in {"background", "idempotency_key"}
+        }
+        initial_request_hash = (
+            self._codec.keyed_json_hash(semantic_initial_context) if initial_idempotency_hash else None
+        )
         with self._write() as connection:
             if initial_idempotency_hash:
                 existing = connection.execute(
-                    """SELECT thread_id FROM conversation_threads
+                    """SELECT thread_id,initial_request_hash FROM conversation_threads
                        WHERE tool_name=? AND initial_idempotency_hash=?""",
                     (tool_name, initial_idempotency_hash),
                 ).fetchone()
                 if existing:
+                    if existing["initial_request_hash"] not in (None, initial_request_hash):
+                        raise IdempotencyConflict("idempotency key was reused with a different initial request")
                     self._thread_row(connection, existing["thread_id"], now=now)
                     return existing["thread_id"]
             if parent_thread_id:
@@ -494,8 +535,8 @@ class SQLiteConversationStorage:
             connection.execute(
                 """INSERT INTO conversation_threads
                    (thread_id,parent_thread_id,tool_name,created_at_us,updated_at_us,expires_at_us,
-                    initial_payload,initial_idempotency_hash)
-                   VALUES(?,?,?,?,?,?,?,?)""",
+                    initial_payload,initial_idempotency_hash,initial_request_hash)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
                 (
                     thread_id,
                     parent_thread_id,
@@ -505,6 +546,7 @@ class SQLiteConversationStorage:
                     now + int(ttl_seconds) * 1_000_000,
                     self._codec.encrypt(initial_context, f"thread:{thread_id}"),
                     initial_idempotency_hash,
+                    initial_request_hash,
                 ),
             )
         return thread_id
@@ -535,6 +577,37 @@ class SQLiteConversationStorage:
             )
         return True
 
+    def _interrupt_stale_pal_runs_in_transaction(self, connection: sqlite3.Connection, now: int) -> int:
+        rows = connection.execute(
+            """SELECT run_id,exchange_id,continuation_id FROM clink_runs
+               WHERE owner_type='pal' AND status IN ('queued','running')
+                 AND lease_expires_at_us IS NOT NULL AND lease_expires_at_us<=?""",
+            (now,),
+        ).fetchall()
+        for stale in rows:
+            connection.execute(
+                """UPDATE clink_runs SET status='interrupted',updated_at_us=?,finished_at_us=?,
+                   lease_expires_at_us=NULL,error_category='pal_lease_expired'
+                   WHERE run_id=? AND status IN ('queued','running')""",
+                (now, now, stale["run_id"]),
+            )
+            if stale["exchange_id"]:
+                connection.execute(
+                    """UPDATE conversation_exchanges SET status='interrupted',updated_at_us=?,lease_expires_at_us=NULL
+                       WHERE exchange_id=? AND status IN ('admitted','running')""",
+                    (now, stale["exchange_id"]),
+                )
+                connection.execute(
+                    """UPDATE conversation_threads SET active_exchange_id=NULL
+                       WHERE thread_id=? AND active_exchange_id=?""",
+                    (stale["continuation_id"], stale["exchange_id"]),
+                )
+        return len(rows)
+
+    def interrupt_stale_pal_runs(self) -> int:
+        with self._write() as connection:
+            return self._interrupt_stale_pal_runs_in_transaction(connection, _now_us())
+
     def begin_exchange(
         self,
         thread_id: str,
@@ -543,6 +616,7 @@ class SQLiteConversationStorage:
         client_idempotency_key: str | None = None,
         owner_instance_id: str | None = None,
         capability_digest: str | None = None,
+        idempotency_context: dict[str, Any] | None = None,
         ttl_seconds: int = 10_800,
         max_turns: int = 50,
         lease_seconds: int = 90,
@@ -551,6 +625,9 @@ class SQLiteConversationStorage:
         exchange_id = str(uuid.uuid4())
         now = _now_us()
         idem_hash = self._codec.keyed_hash(client_idempotency_key) if client_idempotency_key else None
+        semantic_request = {key: value for key, value in user_turn.items() if key != "timestamp"}
+        semantic_request["execution_request"] = idempotency_context or {}
+        request_hash = self._codec.keyed_json_hash(semantic_request) if idem_hash else None
         with self._write() as connection:
             row = self._thread_row(connection, thread_id, now=now)
             if capability_digest:
@@ -560,24 +637,45 @@ class SQLiteConversationStorage:
                 ).fetchone()
                 if ready is None:
                     raise ExecutionReadinessError("no fresh matching execution capability")
+            self._interrupt_stale_pal_runs_in_transaction(connection, now)
             if idem_hash:
                 existing = connection.execute(
-                    """SELECT e.exchange_id,r.run_id FROM conversation_exchanges e
+                    """SELECT e.exchange_id,e.status,e.lease_expires_at_us,e.request_hash,r.run_id
+                       FROM conversation_exchanges e
                        LEFT JOIN clink_runs r ON r.exchange_id=e.exchange_id
                        WHERE e.thread_id=? AND e.idempotency_hash=?""",
                     (thread_id, idem_hash),
                 ).fetchone()
                 if existing:
+                    if existing["request_hash"] not in (None, request_hash):
+                        raise IdempotencyConflict("idempotency key was reused with a different request")
                     snapshot = self._load_thread(connection, thread_id)
+                    if existing["run_id"] is None and (
+                        existing["status"] in {"failed", "interrupted", "abandoned"}
+                        or (existing["lease_expires_at_us"] or 0) <= now
+                    ):
+                        connection.execute(
+                            """UPDATE conversation_exchanges
+                               SET status='admitted',request_hash=COALESCE(request_hash,?),failure_category=NULL,
+                                   updated_at_us=?,lease_expires_at_us=? WHERE exchange_id=?""",
+                            (request_hash, now, now + int(lease_seconds) * 1_000_000, existing["exchange_id"]),
+                        )
+                        connection.execute(
+                            "UPDATE conversation_threads SET active_exchange_id=? WHERE thread_id=?",
+                            (existing["exchange_id"], thread_id),
+                        )
+                        return ExchangeAdmission(existing["exchange_id"], snapshot, False)
                     return ExchangeAdmission(existing["exchange_id"], snapshot, True, existing["run_id"])
             active = connection.execute(
-                """SELECT e.exchange_id,e.lease_expires_at_us,r.run_id
+                """SELECT e.exchange_id,e.lease_expires_at_us,r.run_id,r.status AS run_status
                    FROM conversation_exchanges e LEFT JOIN clink_runs r ON r.exchange_id=e.exchange_id
                    WHERE e.thread_id=? AND e.status IN ('admitted','running')""",
                 (thread_id,),
             ).fetchone()
             if active:
-                if active["run_id"] is None and active["lease_expires_at_us"] and active["lease_expires_at_us"] <= now:
+                if active["run_status"] in TERMINAL_RUN_STATUSES or (
+                    active["run_id"] is None and active["lease_expires_at_us"] and active["lease_expires_at_us"] <= now
+                ):
                     connection.execute(
                         "UPDATE conversation_exchanges SET status='interrupted',updated_at_us=? WHERE exchange_id=?",
                         (now, active["exchange_id"]),
@@ -595,8 +693,8 @@ class SQLiteConversationStorage:
             connection.execute(
                 """INSERT INTO conversation_exchanges
                    (exchange_id,thread_id,tool_name,idempotency_hash,status,owner_instance_id,
-                    capability_digest,lease_expires_at_us,created_at_us,updated_at_us)
-                   VALUES(?,?,?,?, 'admitted',?,?,?,?,?)""",
+                    capability_digest,lease_expires_at_us,created_at_us,updated_at_us,request_hash)
+                   VALUES(?,?,?,?, 'admitted',?,?,?,?,?,?)""",
                 (
                     exchange_id,
                     thread_id,
@@ -607,6 +705,7 @@ class SQLiteConversationStorage:
                     now + int(lease_seconds) * 1_000_000,
                     now,
                     now,
+                    request_hash,
                 ),
             )
             connection.execute(
@@ -931,18 +1030,44 @@ class SQLiteConversationStorage:
             self._finalize_run_in_transaction(connection, now=_now_us(), run_id=run_id, **terminal)
         return self.read_run(run_id)
 
-    def enqueue_run(self, run_id: str, envelope: dict[str, Any], available_at_us: int | None = None) -> None:
+    def enqueue_run(
+        self,
+        run_id: str,
+        envelope: dict[str, Any],
+        assigned_worker_instance_id: str,
+        capability_digest: str,
+        available_at_us: int | None = None,
+    ) -> None:
+        cli_name = envelope.get("cli_name")
+        role = envelope.get("role")
+        if not assigned_worker_instance_id or not capability_digest:
+            raise ExecutionReadinessError("queued worker run requires an exact worker assignment")
+        if not cli_name or not role or envelope.get("capability_digest") != capability_digest:
+            raise ExecutionReadinessError("queued worker envelope does not match its attested assignment")
         now = _now_us()
         with self._write() as connection:
+            ready = connection.execute(
+                """SELECT 1 FROM worker_capabilities w
+                   JOIN process_instances p ON p.instance_id=w.owner_instance_id
+                   WHERE w.owner_instance_id=? AND w.cli_name=? AND w.role=? AND w.config_digest=?
+                     AND w.owner_mode='clink_worker'
+                     AND w.expires_at_us>? AND p.stopped_at_us IS NULL AND p.heartbeat_at_us>?""",
+                (assigned_worker_instance_id, cli_name, role, capability_digest, now, now - 50_000_000),
+            ).fetchone()
+            if ready is None:
+                raise ExecutionReadinessError("assigned worker capability is no longer fresh")
             connection.execute(
                 """INSERT INTO clink_run_queue
-                   (run_id,status,available_at_us,lease_expires_at_us,envelope_payload)
-                   VALUES(?,'queued',?,?,?)""",
+                   (run_id,status,available_at_us,lease_expires_at_us,envelope_payload,
+                    assigned_worker_instance_id,capability_digest)
+                   VALUES(?,'queued',?,?,?,?,?)""",
                 (
                     run_id,
                     available_at_us or now,
                     now + 90_000_000,
                     self._codec.encrypt(envelope, f"queue:{run_id}"),
+                    assigned_worker_instance_id,
+                    capability_digest,
                 ),
             )
 
@@ -955,23 +1080,51 @@ class SQLiteConversationStorage:
         cli_name: str,
         role: str | None,
         envelope: dict[str, Any],
+        assigned_worker_instance_id: str,
+        capability_digest: str,
     ) -> dict[str, Any]:
         """Atomically persist the worker-owned run and deterministic envelope."""
         _canonical_uuid(run_id, "run_id")
+        if not assigned_worker_instance_id or not capability_digest:
+            raise ExecutionReadinessError("queued worker run requires an exact worker assignment")
+        if (
+            envelope.get("capability_digest") != capability_digest
+            or envelope.get("cli_name") != cli_name
+            or envelope.get("role") != role
+        ):
+            raise ExecutionReadinessError("queued worker envelope does not match its attested assignment")
         now = _now_us()
         with self._write() as connection:
+            ready = connection.execute(
+                """SELECT 1 FROM worker_capabilities w
+                   JOIN process_instances p ON p.instance_id=w.owner_instance_id
+                   WHERE w.owner_instance_id=? AND w.cli_name=? AND w.role=? AND w.config_digest=?
+                     AND w.owner_mode='clink_worker'
+                     AND w.expires_at_us>? AND p.stopped_at_us IS NULL AND p.heartbeat_at_us>?""",
+                (assigned_worker_instance_id, cli_name, role, capability_digest, now, now - 50_000_000),
+            ).fetchone()
+            if ready is None:
+                raise ExecutionReadinessError("assigned worker capability is no longer fresh")
             connection.execute(
                 """INSERT INTO clink_runs
                    (run_id,continuation_id,exchange_id,cli_name,role,status,owner_instance_id,owner_type,
                     created_at_us,updated_at_us,lease_expires_at_us)
-                   VALUES(?,?,?,?,?,'queued',NULL,'worker',?,?,NULL)""",
-                (run_id, continuation_id, exchange_id, cli_name, role, now, now),
+                   VALUES(?,?,?,?,?,'queued',?,'worker',?,?,NULL)""",
+                (run_id, continuation_id, exchange_id, cli_name, role, assigned_worker_instance_id, now, now),
             )
             connection.execute(
                 """INSERT INTO clink_run_queue
-                   (run_id,status,available_at_us,lease_expires_at_us,envelope_payload)
-                   VALUES(?,'queued',?,?,?)""",
-                (run_id, now, now + 90_000_000, self._codec.encrypt(envelope, f"queue:{run_id}")),
+                   (run_id,status,available_at_us,lease_expires_at_us,envelope_payload,
+                    assigned_worker_instance_id,capability_digest)
+                   VALUES(?,'queued',?,?,?,?,?)""",
+                (
+                    run_id,
+                    now,
+                    now + 90_000_000,
+                    self._codec.encrypt(envelope, f"queue:{run_id}"),
+                    assigned_worker_instance_id,
+                    capability_digest,
+                ),
             )
         return self.read_run(run_id) or {}
 
@@ -981,8 +1134,9 @@ class SQLiteConversationStorage:
             row = connection.execute(
                 """SELECT run_id,envelope_payload FROM clink_run_queue
                    WHERE available_at_us<=? AND status='queued' AND lease_expires_at_us>?
+                     AND assigned_worker_instance_id=?
                    ORDER BY available_at_us,run_id LIMIT 1""",
-                (now, now),
+                (now, now, owner_instance_id),
             ).fetchone()
             if row is None:
                 return None
@@ -1045,6 +1199,17 @@ class SQLiteConversationStorage:
                 (now + int(lease_seconds) * 1_000_000, run_id, owner_instance_id),
             )
         return cursor.rowcount == 1
+
+    def heartbeat_queued_runs(self, owner_instance_id: str, lease_seconds: int = 90) -> int:
+        """Keep a healthy worker's backlog live without making it transferable."""
+        now = _now_us()
+        with self._write() as connection:
+            cursor = connection.execute(
+                """UPDATE clink_run_queue SET lease_expires_at_us=?
+                   WHERE status='queued' AND assigned_worker_instance_id=? AND lease_expires_at_us>?""",
+                (now + int(lease_seconds) * 1_000_000, owner_instance_id, now),
+            )
+        return cursor.rowcount
 
     def delete_queue_input(self, run_id: str) -> None:
         with self._write() as connection:
