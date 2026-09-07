@@ -1,7 +1,10 @@
 import os
 import subprocess
 import time
+import uuid
 from pathlib import Path
+
+from utils.sqlite_conversation_storage import SQLiteConversationStorage
 
 
 PAL_ROOT = Path(__file__).parents[1]
@@ -130,3 +133,67 @@ esac
     assert "installed and started" in first_stdout
     assert "installed and started" in second.stdout
     assert loaded.is_file()
+
+
+def test_heartbeat_queued_runs_refreshes_only_healthy_assigned_public_runs(tmp_path):
+    store = SQLiteConversationStorage(tmp_path / "state", tmp_path / "keys" / "state.key")
+    worker_digests = {"worker-1": "worker-1-digest", "worker-2": "worker-2-digest"}
+    for worker, digest in worker_digests.items():
+        store.register_process(worker, "clink_worker")
+        store.publish_capability(
+            cli_name="codex",
+            role="default",
+            config_digest=digest,
+            executable_identity="test-executable",
+            model="gpt-5.6-sol",
+            reasoning_effort="high",
+            owner_instance_id=worker,
+            owner_mode="clink_worker",
+        )
+
+    def queue_run(worker: str) -> str:
+        run_id = str(uuid.uuid4())
+        store.create_queued_worker_run(
+            run_id=run_id,
+            continuation_id=None,
+            exchange_id=None,
+            cli_name="codex",
+            role="default",
+            envelope={
+                "request": run_id,
+                "cli_name": "codex",
+                "role": "default",
+                "capability_digest": worker_digests[worker],
+            },
+            assigned_worker_instance_id=worker,
+            capability_digest=worker_digests[worker],
+        )
+        return run_id
+
+    healthy_run = queue_run("worker-1")
+    other_owner_run = queue_run("worker-2")
+    expired_run = queue_run("worker-1")
+    with store._write() as connection:
+        connection.execute("UPDATE clink_runs SET updated_at_us=1")
+        connection.execute("UPDATE clink_run_queue SET lease_expires_at_us=0 WHERE run_id=?", (expired_run,))
+        before = {
+            row["run_id"]: (row["updated_at_us"], row["lease_expires_at_us"])
+            for row in connection.execute(
+                """SELECT r.run_id,r.updated_at_us,q.lease_expires_at_us
+                   FROM clink_runs r JOIN clink_run_queue q ON q.run_id=r.run_id"""
+            )
+        }
+
+    assert store.heartbeat_queued_runs("worker-1", lease_seconds=300) == 1
+
+    after = {
+        row["run_id"]: (row["updated_at_us"], row["lease_expires_at_us"])
+        for row in store.connection().execute(
+            """SELECT r.run_id,r.updated_at_us,q.lease_expires_at_us
+               FROM clink_runs r JOIN clink_run_queue q ON q.run_id=r.run_id"""
+        )
+    }
+    assert after[healthy_run][0] > before[healthy_run][0]
+    assert after[healthy_run][1] > before[healthy_run][1]
+    assert after[other_owner_run] == before[other_owner_run]
+    assert after[expired_run] == before[expired_run]

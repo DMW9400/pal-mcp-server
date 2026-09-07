@@ -1204,6 +1204,14 @@ class SQLiteConversationStorage:
         """Keep a healthy worker's backlog live without making it transferable."""
         now = _now_us()
         with self._write() as connection:
+            connection.execute(
+                """UPDATE clink_runs SET updated_at_us=?
+                   WHERE run_id IN (
+                       SELECT run_id FROM clink_run_queue
+                       WHERE status='queued' AND assigned_worker_instance_id=? AND lease_expires_at_us>?
+                   )""",
+                (now, owner_instance_id, now),
+            )
             cursor = connection.execute(
                 """UPDATE clink_run_queue SET lease_expires_at_us=?
                    WHERE status='queued' AND assigned_worker_instance_id=? AND lease_expires_at_us>?""",
